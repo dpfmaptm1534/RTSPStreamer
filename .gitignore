@@ -1,0 +1,29 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Bundled third-party binaries and archives
+ffmpeg.exe
+mediamtx.exe
+ffmpeg-*/
+mediamtx_*/
+*.zip
+*.crdownload
+
+# Runtime and test files
+*.log
+auto.crt
+auto.key
+rtsp_test_source.mp4
+
+# Editors / OS
+.idea/
+.vscode/
+Thumbs.db
+Desktop.ini
