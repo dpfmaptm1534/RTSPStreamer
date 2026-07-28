@@ -17,6 +17,7 @@ FFMPEG_PATH = os.path.join(CURRENT_DIR, "ffmpeg.exe")
 MEDIAMTX_PATH = os.path.join(CURRENT_DIR, "mediamtx.exe")
 MEDIAMTX_CONFIG_PATH = os.path.join(CURRENT_DIR, "mediamtx.yml")
 MEDIAMTX_LOG_PATH = os.path.join(CURRENT_DIR, "mediamtx.log")
+FFMPEG_LOG_PATH = os.path.join(CURRENT_DIR, "ffmpeg.log")
 DEFAULT_RTSP_URL = "rtsp://127.0.0.1:8554/live/stream"
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
@@ -39,6 +40,7 @@ class RTSPStreamerGUI:
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.start_internal_server()
 
+    # 위젯 생성 함수 
     def create_widgets(self):
         file_frame = tk.LabelFrame(
             self.root, text=" 1. 송출할 영상 파일 ", padx=10, pady=10
@@ -103,6 +105,7 @@ class RTSPStreamerGUI:
         )
         self.btn_action.pack(side="right", padx=5)
 
+    # 서버 상태 표시 업데이트
     def set_server_status(self, text, color, ready=False):
         if self.closing:
             return
@@ -110,6 +113,7 @@ class RTSPStreamerGUI:
         if not self.is_streaming:
             self.btn_action.config(state="normal" if ready else "disabled")
 
+    # 서버 시작 함수
     def start_internal_server(self):
         if not os.path.isfile(MEDIAMTX_PATH):
             messagebox.showerror("실행 오류", "mediamtx.exe를 찾을 수 없습니다.")
@@ -122,6 +126,7 @@ class RTSPStreamerGUI:
 
         threading.Thread(target=self._start_server_worker, daemon=True).start()
 
+    # 서버 시작 작업을 수행하는 함수
     def _start_server_worker(self):
         if self._port_is_open("127.0.0.1", 8554):
             self.root.after(
@@ -166,6 +171,7 @@ class RTSPStreamerGUI:
             detail = str(exc).strip() or "알 수 없는 서버 실행 오류"
             self.root.after(0, lambda: self._show_server_error(detail))
 
+    # 서버 실행 오류를 표시하는 함수
     def _show_server_error(self, detail):
         self.set_server_status("RTSP 서버: 실행 실패", "#dc2626")
         messagebox.showerror(
@@ -173,6 +179,7 @@ class RTSPStreamerGUI:
             f"내장 RTSP 서버를 시작하지 못했습니다.\n\n{detail}",
         )
 
+    # 포트가 열려 있는지 확인하는 정적 메서드
     @staticmethod
     def _port_is_open(host, port):
         try:
@@ -181,6 +188,7 @@ class RTSPStreamerGUI:
         except OSError:
             return False
 
+    # 서버 로그를 읽는 함수
     def _read_server_log(self):
         if self.server_log_file:
             self.server_log_file.flush()
@@ -190,6 +198,7 @@ class RTSPStreamerGUI:
         except OSError:
             return "MediaMTX가 시작 직후 종료되었습니다."
 
+    # 파일 선택 대화상자를 여는 함수
     def browse_file(self):
         selected_file = filedialog.askopenfilename(
             title="송출할 영상 선택",
@@ -202,12 +211,14 @@ class RTSPStreamerGUI:
             self.video_path = selected_file
             self.lbl_file.config(text=os.path.basename(selected_file), fg="black")
 
+    # 송출 시작/중지 토글 함수
     def toggle_streaming(self):
         if self.is_streaming:
             self.stop_streaming()
         else:
             self.start_streaming()
 
+    # 송출 시작 함수
     def start_streaming(self):
         if not os.path.isfile(self.video_path):
             messagebox.showwarning("파일 확인", "먼저 송출할 영상 파일을 선택해 주세요.")
@@ -234,7 +245,45 @@ class RTSPStreamerGUI:
             target=self._run_ffmpeg, args=(rtsp_url,), daemon=True
         ).start()
 
+    # FFmpeg를 실행하여 RTSP 송출을 수행하는 함수
     def _run_ffmpeg(self, rtsp_url):
+        attempts = [
+            self._build_ffmpeg_command(rtsp_url, repair_timestamps=False),
+            self._build_ffmpeg_command(rtsp_url, repair_timestamps=True),
+        ]
+        last_error = ""
+
+        try:
+            for attempt_number, command in enumerate(attempts):
+                if not self.is_streaming or self.closing:
+                    return
+
+                if attempt_number == 1:
+                    self.root.after(0, self._mark_repairing)
+
+                return_code, error_text = self._execute_ffmpeg(command)
+                last_error = error_text
+
+                if return_code == 0 or not self.is_streaming or self.closing:
+                    return
+
+                if attempt_number == 0 and self._is_timestamp_error(error_text):
+                    continue
+                break
+
+            if self.is_streaming and not self.closing:
+                detail = last_error.strip() or "FFmpeg가 오류 코드와 함께 종료되었습니다."
+                self.root.after(0, lambda: self._show_stream_error(detail[-4000:]))
+        except Exception as exc:
+            if not self.closing:
+                self.root.after(0, lambda: self._show_stream_error(str(exc)))
+        finally:
+            self.ffmpeg_process = None
+            if not self.closing:
+                self.root.after(0, self._reset_stream_ui)
+
+    # FFmpeg 명령어를 구성하는 함수
+    def _build_ffmpeg_command(self, rtsp_url, repair_timestamps):
         command = [
             FFMPEG_PATH,
             "-hide_banner",
@@ -243,6 +292,22 @@ class RTSPStreamerGUI:
             "-re",
             "-stream_loop",
             "-1",
+        ]
+
+        if repair_timestamps:
+            command.extend(
+                [
+                    "-ignore_editlist",
+                    "1",
+                    "-fflags",
+                    "+genpts+discardcorrupt",
+                    "-err_detect",
+                    "ignore_err",
+                ]
+            )
+
+        command.extend(
+            [
             "-i",
             self.video_path,
             "-map",
@@ -276,48 +341,75 @@ class RTSPStreamerGUI:
             "-rtsp_transport",
             "tcp",
             rtsp_url,
-        ]
+            ]
+        )
+        return command
+
+    # FFmpeg를 실행하고 오류를 처리하는 함수
+    def _execute_ffmpeg(self, command):
+        self.ffmpeg_process = subprocess.Popen(
+            command,
+            cwd=CURRENT_DIR,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            creationflags=CREATE_NO_WINDOW,
+        )
+
+        time.sleep(1)
+        if self.ffmpeg_process.poll() is None and self.is_streaming:
+            self.root.after(0, self._mark_streaming)
+
+        _, stderr = self.ffmpeg_process.communicate()
+        return_code = self.ffmpeg_process.returncode
+        error_text = stderr.decode("utf-8", errors="replace").strip()
 
         try:
-            self.ffmpeg_process = subprocess.Popen(
-                command,
-                cwd=CURRENT_DIR,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                creationflags=CREATE_NO_WINDOW,
-            )
+            with open(FFMPEG_LOG_PATH, "w", encoding="utf-8", errors="replace") as log:
+                log.write(error_text)
+        except OSError:
+            pass
 
-            time.sleep(1)
-            if self.ffmpeg_process.poll() is None and self.is_streaming:
-                self.root.after(0, self._mark_streaming)
+        self.ffmpeg_process = None
+        return return_code, error_text
 
-            _, stderr = self.ffmpeg_process.communicate()
-            return_code = self.ffmpeg_process.returncode
-            if return_code != 0 and self.is_streaming and not self.closing:
-                detail = stderr.decode("utf-8", errors="replace").strip()
-                if not detail:
-                    detail = f"FFmpeg 종료 코드: {return_code}"
-                self.root.after(0, lambda: self._show_stream_error(detail[-4000:]))
-        except Exception as exc:
-            if not self.closing:
-                self.root.after(0, lambda: self._show_stream_error(str(exc)))
-        finally:
-            self.ffmpeg_process = None
-            if not self.closing:
-                self.root.after(0, self._reset_stream_ui)
+    # 타임스탬프 관련 오류인지 확인하는 정적 메서드
+    @staticmethod
+    def _is_timestamp_error(error_text):
+        lowered = error_text.lower()
+        indicators = (
+            "missing key frame",
+            "cannot find an index entry",
+            "edit list",
+            "non-monotonous dts",
+            "invalid, non monotonically increasing dts",
+            "operation not permitted",
+        )
+        return any(indicator in lowered for indicator in indicators)
 
+    # FFmpeg 상태를 "복구 재시도 중"으로 표시하는 함수
+    def _mark_repairing(self):
+        if not self.is_streaming or self.closing:
+            return
+        self.btn_action.config(text="복구 재시도 중...", bg="#d97706", state="disabled")
+        self.lbl_status.config(
+            text="상태: 영상 타임스탬프를 복구하여 다시 연결 중...", fg="#d97706"
+        )
+
+    # FFmpeg 상태를 "송출 중"으로 표시하는 함수
     def _mark_streaming(self):
         if not self.is_streaming or self.closing:
             return
         self.btn_action.config(text="송출 중지", bg="#dc2626", state="normal")
         self.lbl_status.config(text="상태: 송출 중 (영상 반복 재생)", fg="#16a34a")
 
+    # FFmpeg 송출 오류를 표시하는 함수
     def _show_stream_error(self, detail):
         messagebox.showerror(
             "RTSP 송출 실패",
             f"송출을 시작하지 못했거나 송출이 중단되었습니다.\n\n{detail}",
         )
 
+    # 송출 중지 함수
     def stop_streaming(self):
         self.is_streaming = False
         process = self.ffmpeg_process
@@ -332,6 +424,7 @@ class RTSPStreamerGUI:
                     pass
         self._reset_stream_ui()
 
+    # 송출 UI를 초기 상태로 되돌리는 함수
     def _reset_stream_ui(self):
         if self.closing:
             return
@@ -341,6 +434,7 @@ class RTSPStreamerGUI:
         self.entry_url.config(state="normal")
         self.lbl_status.config(text="상태: 대기 중", fg="#2563eb")
 
+    # 프로그램 종료 시 리소스를 정리하는 함수
     def close(self):
         self.closing = True
         self.is_streaming = False
