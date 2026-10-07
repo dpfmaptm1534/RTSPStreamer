@@ -18,6 +18,8 @@ mediamtx_*/
 
 # Runtime and test files
 *.log
+recent_settings.json
+stream_values.db
 auto.crt
 auto.key
 rtsp_test_source.mp4
