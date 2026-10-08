@@ -66,7 +66,10 @@ class RTSPStreamerGUI:
         self.edit_entry = None
         self.active_cell_item = ""
         self.active_cell_column = "value"
+        self.selected_cells = set()
+        self.selection_anchor_cell = None
         self.cell_border_parts = []
+        self.selected_cell_border_parts = []
 
         self.create_widgets()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
@@ -1364,37 +1367,37 @@ class RTSPStreamerGUI:
         )
         self.refresh_tree()
         item = str(len(self.schedule_rows) - 1)
-        self.tree.selection_set(item)
-        self.tree.focus(item)
+        self.set_active_cell(item, "time")
         self.tree.see(item)
 
     def delete_selected_rows(self):
         self.finish_cell_edit(save=False)
-        selected = self.tree.selection()
-        if not selected:
-            focused = self.tree.focus()
-            selected = (focused,) if focused else ()
-        if not selected:
+        indexes = {int(item) for item, _column in self.get_selected_cells()}
+        if not indexes:
+            selected = self.tree.selection()
+            if not selected:
+                focused = self.tree.focus()
+                selected = (focused,) if focused else ()
+            for item in selected:
+                try:
+                    indexes.add(int(item))
+                except ValueError:
+                    continue
+        if not indexes:
             return
-
-        indexes = set()
-        for item in selected:
-            try:
-                indexes.add(int(item))
-            except ValueError:
-                continue
 
         self.schedule_rows = [
             row for index, row in enumerate(self.schedule_rows) if index not in indexes
         ]
+        self.selected_cells = set()
+        self.selection_anchor_cell = None
         self.refresh_tree()
 
         if self.schedule_rows:
             next_index = min(indexes) if indexes else 0
             next_index = min(next_index, len(self.schedule_rows) - 1)
             item = str(next_index)
-            self.tree.selection_set(item)
-            self.tree.focus(item)
+            self.set_active_cell(item, self.active_cell_column)
             self.tree.see(item)
 
     def refresh_tree(self):
@@ -1404,11 +1407,21 @@ class RTSPStreamerGUI:
         for index, row in enumerate(self.schedule_rows):
             self.tree.insert("", "end", iid=str(index), values=(row["time"], row.get("value", "")))
         if self.schedule_rows:
+            valid_items = {str(index) for index in range(len(self.schedule_rows))}
+            self.selected_cells = {
+                (item, column)
+                for item, column in self.selected_cells
+                if item in valid_items and column in ("time", "value")
+            }
             if not self.active_cell_item or int(self.active_cell_item) >= len(self.schedule_rows):
                 self.active_cell_item = "0"
-            self.set_active_cell(self.active_cell_item, self.active_cell_column)
+            if not self.selected_cells:
+                self.selected_cells = {(self.active_cell_item, self.active_cell_column)}
+            self.set_active_cell(self.active_cell_item, self.active_cell_column, reset_selection=False)
         else:
             self.active_cell_item = ""
+            self.selected_cells = set()
+            self.selection_anchor_cell = None
             self.hide_active_cell_border()
 
     def clear_values(self):
@@ -1458,7 +1471,7 @@ class RTSPStreamerGUI:
     def tree_column_to_id(column_name):
         return "#1" if column_name == "time" else "#2"
 
-    def set_active_cell(self, item, column_name):
+    def set_active_cell(self, item, column_name, reset_selection=True):
         if not item:
             self.hide_active_cell_border()
             return
@@ -1466,12 +1479,52 @@ class RTSPStreamerGUI:
             column_name = "value"
         self.active_cell_item = str(item)
         self.active_cell_column = column_name
+        if reset_selection:
+            self.selected_cells = {(self.active_cell_item, self.active_cell_column)}
+            self.selection_anchor_cell = (self.active_cell_item, self.active_cell_column)
         self.tree.focus(str(item))
         self.tree.selection_set(str(item))
         self.tree.focus_set()
         self.draw_active_cell_border()
 
+    def set_selected_cell_range(self, start_cell, end_cell):
+        children = list(self.tree.get_children())
+        if not children:
+            self.selected_cells = set()
+            return
+
+        columns = ["time", "value"]
+        start_item, start_col = start_cell
+        end_item, end_col = end_cell
+        try:
+            start_row = children.index(str(start_item))
+            end_row = children.index(str(end_item))
+            start_col_index = columns.index(start_col)
+            end_col_index = columns.index(end_col)
+        except ValueError:
+            self.selected_cells = {(str(end_item), end_col)}
+            return
+
+        row_min, row_max = sorted((start_row, end_row))
+        col_min, col_max = sorted((start_col_index, end_col_index))
+        self.selected_cells = {
+            (children[row_index], columns[col_index])
+            for row_index in range(row_min, row_max + 1)
+            for col_index in range(col_min, col_max + 1)
+        }
+
+    def get_selected_cells(self):
+        cells = {
+            (str(item), column)
+            for item, column in self.selected_cells
+            if column in ("time", "value") and str(item) in self.tree.get_children()
+        }
+        if not cells and self.active_cell_item:
+            cells = {(self.active_cell_item, self.active_cell_column)}
+        return cells
+
     def draw_active_cell_border(self):
+        self.draw_selected_cell_borders()
         if not self.active_cell_item:
             self.hide_active_cell_border()
             return
@@ -1488,9 +1541,39 @@ class RTSPStreamerGUI:
         left.place(x=x, y=y, width=thickness, height=height)
         right.place(x=x + width - thickness, y=y, width=thickness, height=height)
 
+    def draw_selected_cell_borders(self):
+        for part in self.selected_cell_border_parts:
+            part.destroy()
+        self.selected_cell_border_parts = []
+
+        for item, column_name in sorted(self.get_selected_cells(), key=lambda cell: (int(cell[0]), cell[1])):
+            if item == self.active_cell_item and column_name == self.active_cell_column:
+                continue
+            bbox = self.tree.bbox(item, self.tree_column_to_id(column_name))
+            if not bbox:
+                continue
+            self.selected_cell_border_parts.extend(
+                self.create_cell_border_parts(bbox, color="#2563eb", thickness=2)
+            )
+
+    def create_cell_border_parts(self, bbox, color, thickness):
+        x, y, width, height = bbox
+        top = tk.Frame(self.tree, bg=color)
+        bottom = tk.Frame(self.tree, bg=color)
+        left = tk.Frame(self.tree, bg=color)
+        right = tk.Frame(self.tree, bg=color)
+        top.place(x=x, y=y, width=width, height=thickness)
+        bottom.place(x=x, y=y + height - thickness, width=width, height=thickness)
+        left.place(x=x, y=y, width=thickness, height=height)
+        right.place(x=x + width - thickness, y=y, width=thickness, height=height)
+        return [top, bottom, left, right]
+
     def hide_active_cell_border(self):
         for part in self.cell_border_parts:
             part.place_forget()
+        for part in self.selected_cell_border_parts:
+            part.destroy()
+        self.selected_cell_border_parts = []
 
     def select_clicked_cell(self, event):
         region = self.tree.identify("region", event.x, event.y)
@@ -1501,7 +1584,33 @@ class RTSPStreamerGUI:
         if not item or column_id not in ("#1", "#2"):
             return
         self.finish_cell_edit(save=True)
-        self.set_active_cell(item, self.tree_column_from_id(column_id))
+        column_name = self.tree_column_from_id(column_id)
+        ctrl_pressed = bool(event.state & 0x0004)
+        shift_pressed = bool(event.state & 0x0001)
+
+        if shift_pressed and self.selection_anchor_cell:
+            self.active_cell_item = str(item)
+            self.active_cell_column = column_name
+            self.set_selected_cell_range(self.selection_anchor_cell, (str(item), column_name))
+            self.tree.focus(str(item))
+            self.tree.selection_set(str(item))
+            self.tree.focus_set()
+            self.draw_active_cell_border()
+        elif ctrl_pressed:
+            cell = (str(item), column_name)
+            self.active_cell_item = str(item)
+            self.active_cell_column = column_name
+            if cell in self.selected_cells and len(self.selected_cells) > 1:
+                self.selected_cells.remove(cell)
+            else:
+                self.selected_cells.add(cell)
+            self.selection_anchor_cell = cell
+            self.tree.focus(str(item))
+            self.tree.selection_set(str(item))
+            self.tree.focus_set()
+            self.draw_active_cell_border()
+        else:
+            self.set_active_cell(item, column_name)
         return "break"
 
     def start_cell_edit(self, event=None):
@@ -1719,26 +1828,38 @@ class RTSPStreamerGUI:
             selected = [focused] if focused else []
         return sorted(selected, key=lambda item: int(item))
 
+    def get_cell_text(self, index, column_name):
+        if not (0 <= index < len(self.schedule_rows)):
+            return ""
+        if column_name == "time":
+            return str(self.schedule_rows[index].get("time", ""))
+        return str(self.schedule_rows[index].get("value", ""))
+
     def copy_selected_values(self, _event=None):
         self.finish_cell_edit(save=True)
-        item = self.active_cell_item or self.tree.focus()
-        if not item:
+        cells = self.get_selected_cells()
+        if not cells:
             return "break"
 
-        try:
-            index = int(item)
-        except ValueError:
-            return "break"
-        if not (0 <= index < len(self.schedule_rows)):
-            return "break"
+        columns = ["time", "value"]
+        row_indexes = [int(item) for item, _column in cells]
+        col_indexes = [columns.index(column) for _item, column in cells]
+        row_min, row_max = min(row_indexes), max(row_indexes)
+        col_min, col_max = min(col_indexes), max(col_indexes)
 
-        if self.active_cell_column == "time":
-            value = str(self.schedule_rows[index].get("time", ""))
-        else:
-            value = str(self.schedule_rows[index].get("value", ""))
+        lines = []
+        for row_index in range(row_min, row_max + 1):
+            row_values = []
+            for col_index in range(col_min, col_max + 1):
+                column_name = columns[col_index]
+                if (str(row_index), column_name) in cells:
+                    row_values.append(self.get_cell_text(row_index, column_name))
+                else:
+                    row_values.append("")
+            lines.append("\t".join(row_values))
 
         self.root.clipboard_clear()
-        self.root.clipboard_append(value)
+        self.root.clipboard_append("\n".join(lines))
         return "break"
 
     def cut_selected_values(self, _event=None):
@@ -1748,16 +1869,18 @@ class RTSPStreamerGUI:
 
     def clear_selected_values(self, _event=None):
         self.finish_cell_edit(save=False)
-        item = self.active_cell_item or self.tree.focus()
-        if not item:
-            return "break"
-        try:
-            index = int(item)
-        except ValueError:
+        cells = self.get_selected_cells()
+        if not cells:
             return "break"
 
-        if 0 <= index < len(self.schedule_rows):
-            if self.active_cell_column == "time":
+        for item, column_name in cells:
+            try:
+                index = int(item)
+            except ValueError:
+                continue
+            if not (0 <= index < len(self.schedule_rows)):
+                continue
+            if column_name == "time":
                 self.schedule_rows[index]["offset"] = 0.0
                 self.schedule_rows[index]["time"] = "00:00"
                 self.tree.set(item, "time", "00:00")
