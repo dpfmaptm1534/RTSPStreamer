@@ -70,6 +70,12 @@ class RTSPStreamerGUI:
         self.selection_anchor_cell = None
         self.cell_border_parts = []
         self.selected_cell_border_parts = []
+        self.highlighted_row_index = None
+        self.progress_thread = None
+        self.streaming_source_mode = "file"
+        self.streaming_interval_seconds = 1
+        self.streaming_webcam_device = ""
+        self.streaming_video_path = ""
 
         self.create_widgets()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
@@ -368,6 +374,7 @@ class RTSPStreamerGUI:
         )
 
         self.cell_border_parts = [tk.Frame(self.tree, bg="#111827") for _ in range(4)]
+        self.tree.tag_configure("elapsed_row", background="#d9f99d")
 
         y_scroll = ttk.Scrollbar(tree_box, orient="vertical", command=self.tree_yview)
         self.tree.configure(yscrollcommand=lambda first, last: self.tree_yscroll_set(y_scroll, first, last))
@@ -401,6 +408,7 @@ class RTSPStreamerGUI:
         self.register_drop_target(self.tree)
         self.register_drop_target(table_frame)
         self.update_time_table_labels()
+        self.root.bind_all("<Button-1>", self.clear_cell_selection_if_outside, add="+")
 
     def update_time_table_labels(self):
         if self.source_mode_var.get() == "webcam":
@@ -1405,7 +1413,14 @@ class RTSPStreamerGUI:
         for item in self.tree.get_children():
             self.tree.delete(item)
         for index, row in enumerate(self.schedule_rows):
-            self.tree.insert("", "end", iid=str(index), values=(row["time"], row.get("value", "")))
+            tags = ("elapsed_row",) if self.highlighted_row_index == index else ()
+            self.tree.insert(
+                "",
+                "end",
+                iid=str(index),
+                values=(row["time"], row.get("value", "")),
+                tags=tags,
+            )
         if self.schedule_rows:
             valid_items = {str(index) for index in range(len(self.schedule_rows))}
             self.selected_cells = {
@@ -1423,6 +1438,65 @@ class RTSPStreamerGUI:
             self.selected_cells = set()
             self.selection_anchor_cell = None
             self.hide_active_cell_border()
+
+    def append_schedule_row_direct(self, offset, value):
+        index = len(self.schedule_rows)
+        row = {
+            "offset": float(offset),
+            "time": self.format_time(offset),
+            "value": str(value),
+        }
+        self.schedule_rows.append(row)
+        tags = ("elapsed_row",) if self.highlighted_row_index == index else ()
+        self.tree.insert(
+            "",
+            "end",
+            iid=str(index),
+            values=(row["time"], row.get("value", "")),
+            tags=tags,
+        )
+        self.update_main_scroll_region()
+
+    def set_elapsed_highlight(self, row_index):
+        if self.closing:
+            return
+        if not self.is_streaming and row_index is not None:
+            return
+        if row_index is None or row_index < 0 or row_index >= len(self.schedule_rows):
+            if self.highlighted_row_index is not None:
+                old_item = str(self.highlighted_row_index)
+                if old_item in self.tree.get_children():
+                    self.tree.item(old_item, tags=())
+            self.highlighted_row_index = None
+            return
+
+        if self.highlighted_row_index == row_index:
+            return
+        if self.highlighted_row_index is not None:
+            old_item = str(self.highlighted_row_index)
+            if old_item in self.tree.get_children():
+                self.tree.item(old_item, tags=())
+        self.highlighted_row_index = row_index
+        item = str(row_index)
+        if item in self.tree.get_children():
+            self.tree.item(item, tags=("elapsed_row",))
+            self.tree.see(item)
+        self.draw_active_cell_border()
+
+    def get_elapsed_row_index(self, elapsed):
+        if not self.schedule_rows:
+            return None
+        current_index = None
+        for index, row in enumerate(self.schedule_rows):
+            try:
+                offset = float(row.get("offset", 0) or 0)
+            except (TypeError, ValueError):
+                offset = 0.0
+            if elapsed >= offset:
+                current_index = index
+            else:
+                break
+        return current_index if current_index is not None else 0
 
     def clear_values(self):
         selected = self.tree.selection()
@@ -1578,6 +1652,7 @@ class RTSPStreamerGUI:
     def select_clicked_cell(self, event):
         region = self.tree.identify("region", event.x, event.y)
         if region != "cell":
+            self.clear_cell_selection()
             return
         item = self.tree.identify_row(event.y)
         column_id = self.tree.identify_column(event.x)
@@ -1612,6 +1687,30 @@ class RTSPStreamerGUI:
         else:
             self.set_active_cell(item, column_name)
         return "break"
+
+    def clear_cell_selection_if_outside(self, event):
+        widget = event.widget
+        widget_path = str(widget)
+        tree_path = str(self.tree)
+        if widget_path == tree_path or widget_path.startswith(tree_path + "."):
+            return
+        if self.edit_entry is not None and (
+            widget is self.edit_entry or widget_path.startswith(str(self.edit_entry) + ".")
+        ):
+            return
+        self.clear_cell_selection()
+
+    def clear_cell_selection(self):
+        self.finish_cell_edit(save=True)
+        self.active_cell_item = ""
+        self.active_cell_column = "value"
+        self.selected_cells = set()
+        self.selection_anchor_cell = None
+        try:
+            self.tree.selection_remove(self.tree.selection())
+        except tk.TclError:
+            pass
+        self.hide_active_cell_border()
 
     def start_cell_edit(self, event=None):
         if event is not None:
@@ -1925,6 +2024,10 @@ class RTSPStreamerGUI:
                 messagebox.showerror("DB 설정 오류", str(exc))
                 return
 
+        interval_seconds = self.get_interval_seconds_from_ui()
+        if interval_seconds is None:
+            return
+
         if source_mode == "webcam":
             self.stop_webcam_preview(clear_image=False)
             self.lbl_preview_status.config(
@@ -1933,6 +2036,11 @@ class RTSPStreamerGUI:
             )
 
         self.is_streaming = True
+        self.highlighted_row_index = None
+        self.streaming_source_mode = source_mode
+        self.streaming_interval_seconds = interval_seconds
+        self.streaming_webcam_device = self.webcam_var.get().strip()
+        self.streaming_video_path = self.video_path
         self.btn_action.config(text="연결 중...", bg="#d97706", state="disabled")
         self.btn_browse.config(state="disabled")
         self.combo_webcam.config(state="disabled")
@@ -1943,6 +2051,9 @@ class RTSPStreamerGUI:
         if self.db_enabled_var.get():
             self.db_thread = threading.Thread(target=self._run_db_scheduler, daemon=True)
             self.db_thread.start()
+
+        self.progress_thread = threading.Thread(target=self._run_elapsed_highlight, daemon=True)
+        self.progress_thread.start()
 
         threading.Thread(target=self._run_ffmpeg, args=(rtsp_url,), daemon=True).start()
 
@@ -2063,6 +2174,18 @@ class RTSPStreamerGUI:
                 cursor.execute(query)
             conn.commit()
 
+    def _run_elapsed_highlight(self):
+        start_mono = time.monotonic()
+        is_file_source = self.streaming_source_mode == "file"
+        duration = max(self.video_duration, 1.0)
+
+        while self.is_streaming and not self.closing:
+            elapsed = time.monotonic() - start_mono
+            display_elapsed = elapsed % duration if is_file_source and duration > 0 else elapsed
+            row_index = self.get_elapsed_row_index(display_elapsed)
+            self.root.after(0, lambda idx=row_index: self.set_elapsed_highlight(idx))
+            time.sleep(0.25)
+
     def _run_db_scheduler(self):
         rows = [
             dict(row)
@@ -2083,8 +2206,9 @@ class RTSPStreamerGUI:
         cycle_index = 0
         inserted = set()
         insert_count = 0
-        is_file_source = self.source_mode_var.get() == "file"
+        is_file_source = self.streaming_source_mode == "file"
         duration = max(self.video_duration, 1.0)
+        interval_seconds = max(float(self.streaming_interval_seconds), 1.0)
 
         self.root.after(0, lambda: self.lbl_db_status.config(text="DB INSERT: 실행 중", fg="#16a34a"))
 
@@ -2115,13 +2239,25 @@ class RTSPStreamerGUI:
                         )
 
             if not is_file_source and len(inserted) >= len(rows):
+                last_row = rows[-1]
+                next_offset = float(last_row.get("offset", 0) or 0) + interval_seconds
+                carry_value = str(last_row.get("value", "")).strip()
+                next_row = {
+                    "offset": float(next_offset),
+                    "time": self.format_time(next_offset),
+                    "value": carry_value,
+                }
+                rows.append(next_row)
+                self.root.after(
+                    0,
+                    lambda offset=next_offset, value=carry_value: self.append_schedule_row_direct(offset, value),
+                )
                 self.root.after(
                     0,
                     lambda count=insert_count: self.lbl_db_status.config(
-                        text=f"DB INSERT: {count}건 입력 완료", fg="#16a34a"
+                        text=f"DB INSERT: {count}건 입력 (마지막 수위값 자동 연장 중)", fg="#16a34a"
                     ),
                 )
-                break
 
             if is_file_source and elapsed >= (cycle_index + 1) * duration + 0.2:
                 cycle_index += 1
@@ -2153,7 +2289,7 @@ class RTSPStreamerGUI:
             conn.commit()
 
     def _run_ffmpeg(self, rtsp_url):
-        if self.source_mode_var.get() == "webcam":
+        if self.streaming_source_mode == "webcam":
             attempts = [self._build_ffmpeg_command(rtsp_url, repair_timestamps=False)]
         else:
             attempts = [
@@ -2198,13 +2334,13 @@ class RTSPStreamerGUI:
             "-re",
         ]
 
-        if self.source_mode_var.get() == "webcam":
+        if self.streaming_source_mode == "webcam":
             command.extend(
                 [
                     "-f",
                     "dshow",
                     "-i",
-                    f"video={self.webcam_var.get()}",
+                    f"video={self.streaming_webcam_device}",
                 ]
             )
         else:
@@ -2215,7 +2351,7 @@ class RTSPStreamerGUI:
                 ]
             )
 
-        if repair_timestamps and self.source_mode_var.get() != "webcam":
+        if repair_timestamps and self.streaming_source_mode != "webcam":
             command.extend(
                 [
                     "-ignore_editlist",
@@ -2227,8 +2363,8 @@ class RTSPStreamerGUI:
                 ]
             )
 
-        if self.source_mode_var.get() != "webcam":
-            command.extend(["-i", self.video_path])
+        if self.streaming_source_mode != "webcam":
+            command.extend(["-i", self.streaming_video_path])
 
         command.extend(
             [
@@ -2356,6 +2492,7 @@ class RTSPStreamerGUI:
         self.lbl_status.config(text="상태: 대기 중", fg="#2563eb")
         if self.db_enabled_var.get():
             self.lbl_db_status.config(text="DB INSERT: 대기", fg="#555555")
+        self.set_elapsed_highlight(None)
         if self.source_mode_var.get() == "webcam" and self.webcam_var.get():
             self.start_webcam_preview()
 
