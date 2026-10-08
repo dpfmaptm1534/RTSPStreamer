@@ -45,7 +45,7 @@ class RTSPStreamerGUI:
         self.root = root
         self.root.title("영상/웹캠 RTSP 송출기 + DB 입력")
         self.root.geometry("1050x760")
-        self.root.minsize(980, 690)
+        self.root.minsize(900, 520)
 
         self.video_path = ""
         self.webcam_devices = []
@@ -70,7 +70,52 @@ class RTSPStreamerGUI:
         self.start_internal_server()
 
     def create_widgets(self):
-        top_frame = tk.Frame(self.root)
+        action_frame = tk.Frame(self.root, bd=1, relief="raised", bg="#f3f4f6")
+        action_frame.pack(side="bottom", fill="x", padx=0, pady=0)
+
+        self.lbl_status = tk.Label(
+            action_frame,
+            text="상태: 대기 중",
+            fg="#2563eb",
+            bg="#f3f4f6",
+            font=("맑은 고딕", 10, "bold"),
+        )
+        self.lbl_status.pack(side="left", padx=18, pady=10)
+
+        self.btn_action = tk.Button(
+            action_frame,
+            text="송출 시작",
+            bg="#16a34a",
+            fg="white",
+            font=("맑은 고딕", 11, "bold"),
+            width=16,
+            height=2,
+            command=self.toggle_streaming,
+            state="disabled",
+        )
+        self.btn_action.pack(side="right", padx=18, pady=8)
+
+        scroll_container = tk.Frame(self.root)
+        scroll_container.pack(side="top", fill="both", expand=True)
+
+        self.main_canvas = tk.Canvas(scroll_container, highlightthickness=0)
+        self.main_scrollbar = ttk.Scrollbar(
+            scroll_container, orient="vertical", command=self.main_canvas.yview
+        )
+        self.main_canvas.configure(yscrollcommand=self.main_scrollbar.set)
+        self.main_scrollbar.pack(side="right", fill="y")
+        self.main_canvas.pack(side="left", fill="both", expand=True)
+
+        self.main_content = tk.Frame(self.main_canvas)
+        self.main_canvas_window = self.main_canvas.create_window(
+            (0, 0), window=self.main_content, anchor="nw"
+        )
+        self.main_content.bind("<Configure>", self.update_main_scroll_region)
+        self.main_canvas.bind("<Configure>", self.resize_main_canvas_window)
+        self.main_canvas.bind("<Enter>", self.enable_main_mousewheel)
+        self.main_canvas.bind("<Leave>", self.disable_main_mousewheel)
+
+        top_frame = tk.Frame(self.main_content)
         top_frame.pack(fill="x", padx=14, pady=(12, 6))
 
         settings_frame = tk.Frame(top_frame)
@@ -171,32 +216,7 @@ class RTSPStreamerGUI:
         )
         self.lbl_server.pack(fill="x", padx=8, pady=(8, 0))
 
-        action_frame = tk.Frame(self.root, bd=1, relief="raised", bg="#f3f4f6")
-        action_frame.pack(side="bottom", fill="x", padx=0, pady=0)
-
-        self.lbl_status = tk.Label(
-            action_frame,
-            text="상태: 대기 중",
-            fg="#2563eb",
-            bg="#f3f4f6",
-            font=("맑은 고딕", 10, "bold"),
-        )
-        self.lbl_status.pack(side="left", padx=18, pady=10)
-
-        self.btn_action = tk.Button(
-            action_frame,
-            text="송출 시작",
-            bg="#16a34a",
-            fg="white",
-            font=("맑은 고딕", 11, "bold"),
-            width=16,
-            height=2,
-            command=self.toggle_streaming,
-            state="disabled",
-        )
-        self.btn_action.pack(side="right", padx=18, pady=8)
-
-        mid_frame = tk.Frame(self.root)
+        mid_frame = tk.Frame(self.main_content)
         mid_frame.pack(fill="both", expand=True, padx=14, pady=6)
 
         db_frame = tk.LabelFrame(mid_frame, text=" 3. DB INSERT 설정 ", padx=10, pady=8)
@@ -345,8 +365,36 @@ class RTSPStreamerGUI:
         self.tree.bind("<Delete>", self.clear_selected_values)
         self.tree.bind("<BackSpace>", self.clear_selected_values)
         self.tree.bind("<Key>", self.start_typing_in_selected_cell)
+        self.tree.bind("<Enter>", self.disable_main_mousewheel)
+        self.tree.bind("<Leave>", self.enable_main_mousewheel)
         self.register_drop_target(self.tree)
         self.register_drop_target(table_frame)
+
+    def update_main_scroll_region(self, _event=None):
+        self.main_canvas.configure(scrollregion=self.main_canvas.bbox("all"))
+
+    def resize_main_canvas_window(self, event):
+        self.main_canvas.itemconfigure(self.main_canvas_window, width=event.width)
+
+    def enable_main_mousewheel(self, _event=None):
+        self.root.bind_all("<MouseWheel>", self.on_main_mousewheel)
+        self.root.bind_all("<Button-4>", self.on_main_mousewheel)
+        self.root.bind_all("<Button-5>", self.on_main_mousewheel)
+
+    def disable_main_mousewheel(self, _event=None):
+        self.root.unbind_all("<MouseWheel>")
+        self.root.unbind_all("<Button-4>")
+        self.root.unbind_all("<Button-5>")
+
+    def on_main_mousewheel(self, event):
+        if getattr(event, "num", None) == 4:
+            delta = -3
+        elif getattr(event, "num", None) == 5:
+            delta = 3
+        else:
+            delta = int(-1 * (event.delta / 120)) if event.delta else 0
+        if delta:
+            self.main_canvas.yview_scroll(delta, "units")
 
     def set_server_status(self, text, color, ready=False):
         if self.closing:
