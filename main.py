@@ -498,6 +498,8 @@ class RTSPStreamerGUI:
                 text="웹캠을 찾지 못했습니다.",
                 bg="black",
                 fg="white",
+            width=44,
+            height=10,
             )
             self.lbl_preview_status.config(text="장치 연결 상태를 확인한 뒤 웹캠 새로고침을 눌러 주세요.", fg="#dc2626")
             if show_error:
@@ -565,6 +567,8 @@ class RTSPStreamerGUI:
             text="웹캠 미리보기 연결 중...",
             bg="black",
             fg="white",
+            width=44,
+            height=10,
         )
         self.lbl_preview_status.config(
             text="선택한 웹캠 화면을 확인하는 중입니다.\n송출 시작 시 미리보기는 자동 중지됩니다.",
@@ -582,7 +586,7 @@ class RTSPStreamerGUI:
             f"video={device_name}",
             "-an",
             "-vf",
-            "fps=5,scale=320:-1",
+            "fps=5,scale=360:-1",
             "-f",
             "image2pipe",
             "-vcodec",
@@ -633,6 +637,8 @@ class RTSPStreamerGUI:
                 text="웹캠을 선택하면 여기에 미리보기가 표시됩니다.",
                 bg="black",
                 fg="white",
+                width=44,
+                height=10,
             )
             self.lbl_preview_status.config(text="", fg="#555555")
 
@@ -700,7 +706,12 @@ class RTSPStreamerGUI:
             return
         try:
             self.preview_image = tk.PhotoImage(data=ppm_data, format="PPM")
-            self.lbl_preview.config(image=self.preview_image, text="")
+            self.lbl_preview.config(
+                image=self.preview_image,
+                text="",
+                width=self.preview_image.width(),
+                height=self.preview_image.height(),
+            )
             self.lbl_preview_status.config(
                 text=f"미리보기 정상 표시 중\n장치: {self.webcam_var.get()}",
                 fg="#16a34a",
@@ -718,7 +729,14 @@ class RTSPStreamerGUI:
         else:
             message = "미리보기가 중지되었습니다."
         self.preview_image = None
-        self.lbl_preview.config(image="", text="웹캠 미리보기 없음", bg="black", fg="white")
+        self.lbl_preview.config(
+            image="",
+            text="웹캠 미리보기 없음",
+            bg="black",
+            fg="white",
+            width=44,
+            height=10,
+        )
         self.lbl_preview_status.config(text=message, fg="#dc2626" if error_text else "#555555")
 
     @classmethod
