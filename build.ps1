@@ -22,6 +22,7 @@ foreach ($requiredFile in @("main.py", "ffmpeg.exe", "mediamtx.exe", "mediamtx.y
     --clean `
     --windowed `
     --onedir `
+    --collect-all "tkinterdnd2" `
     --name "RTSPStreamer" `
     --distpath $DistDir `
     --workpath (Join-Path $ProjectDir "build") `
@@ -44,6 +45,9 @@ Run:
 
 Default publish/playback URL:
   rtsp://127.0.0.1:8554/live/stream
+
+Input:
+  Select either a video file or a webcam from the top source selector.
 
 Important:
   Keep ffmpeg.exe, mediamtx.exe, mediamtx.yml, and the _internal

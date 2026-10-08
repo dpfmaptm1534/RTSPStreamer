@@ -1,3 +1,4 @@
+import csv
 import json
 import os
 import re
@@ -11,8 +12,16 @@ from datetime import datetime
 from tkinter import filedialog, messagebox, ttk
 from urllib.parse import urlparse
 
+import openpyxl
 import psycopg2
+import xlrd
 from psycopg2 import sql
+
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+except ImportError:
+    DND_FILES = None
+    TkinterDnD = None
 
 
 if getattr(sys, "frozen", False):
@@ -33,11 +42,12 @@ CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 class RTSPStreamerGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("영상 파일 RTSP 송출기 + DB 입력")
+        self.root.title("영상/웹캠 RTSP 송출기 + DB 입력")
         self.root.geometry("1050x760")
         self.root.minsize(980, 690)
 
         self.video_path = ""
+        self.webcam_devices = []
         self.video_duration = 0.0
         self.schedule_rows = []
         self.ffmpeg_process = None
@@ -80,8 +90,24 @@ class RTSPStreamerGUI:
         self.combo_recent_settings.bind("<<ComboboxSelected>>", self.load_recent_setting)
         self.load_recent_settings()
 
-        file_frame = tk.LabelFrame(top_frame, text=" 1. 송출할 영상 파일 ", padx=10, pady=10)
+        file_frame = tk.LabelFrame(top_frame, text=" 1. 입력 소스 선택 ", padx=10, pady=10)
         file_frame.pack(fill="x")
+
+        self.source_mode_var = tk.StringVar(value="file")
+        tk.Radiobutton(
+            file_frame,
+            text="영상 파일",
+            variable=self.source_mode_var,
+            value="file",
+            command=self.update_source_mode_ui,
+        ).pack(side="left", padx=(0, 8))
+        tk.Radiobutton(
+            file_frame,
+            text="웹캠",
+            variable=self.source_mode_var,
+            value="webcam",
+            command=self.update_source_mode_ui,
+        ).pack(side="left", padx=(0, 8))
 
         self.lbl_file = tk.Label(file_frame, text="선택된 파일이 없습니다.", fg="gray", anchor="w")
         self.lbl_file.pack(side="left", fill="x", expand=True, padx=5)
@@ -89,8 +115,22 @@ class RTSPStreamerGUI:
         self.lbl_duration = tk.Label(file_frame, text="", fg="#555555")
         self.lbl_duration.pack(side="left", padx=8)
 
+        self.webcam_var = tk.StringVar(value="")
+        self.combo_webcam = ttk.Combobox(
+            file_frame,
+            width=28,
+            textvariable=self.webcam_var,
+            state="readonly",
+            values=[],
+        )
+        self.combo_webcam.bind("<<ComboboxSelected>>", self.on_webcam_selected)
+        self.btn_refresh_webcam = tk.Button(
+            file_frame, text="웹캠 새로고침", width=12, command=self.refresh_webcam_devices
+        )
+
         self.btn_browse = tk.Button(file_frame, text="파일 선택", width=11, command=self.browse_file)
         self.btn_browse.pack(side="right", padx=5)
+        self.update_source_mode_ui()
 
         url_frame = tk.LabelFrame(top_frame, text=" 2. RTSP 송출 주소 ", padx=10, pady=10)
         url_frame.pack(fill="x", pady=(8, 0))
@@ -219,10 +259,27 @@ class RTSPStreamerGUI:
             side="left", padx=8
         )
         tk.Button(toolbar, text="수위값 비우기", command=self.clear_values).pack(side="left")
+        tk.Button(toolbar, text="수위파일 불러오기", command=self.import_level_file).pack(
+            side="left", padx=(8, 0)
+        )
+
+        self.skip_file_first_row_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(
+            toolbar,
+            text="파일 첫 행 건너뛰기",
+            variable=self.skip_file_first_row_var,
+        ).pack(side="left", padx=(8, 0))
+
+        self.skip_table_first_row_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            toolbar,
+            text="표 첫 행 건너뛰기",
+            variable=self.skip_table_first_row_var,
+        ).pack(side="left", padx=(8, 0))
 
         self.lbl_paste_help = tk.Label(
             toolbar,
-            text="엑셀에서 수위값을 여러 행 복사한 뒤 표에서 Ctrl+V로 붙여넣기",
+            text="엑셀/CSV 드래그 또는 불러오기: 선택 행부터 수위값 채움",
             fg="#555555",
         )
         self.lbl_paste_help.pack(side="left", padx=12)
@@ -252,11 +309,17 @@ class RTSPStreamerGUI:
 
         self.tree.bind("<Double-1>", self.start_cell_edit)
         self.tree.bind("<ButtonRelease-1>", self.select_clicked_row)
+        self.tree.bind("<Control-c>", self.copy_selected_values)
+        self.tree.bind("<Control-C>", self.copy_selected_values)
+        self.tree.bind("<Control-x>", self.cut_selected_values)
+        self.tree.bind("<Control-X>", self.cut_selected_values)
         self.tree.bind("<Control-v>", self.paste_from_clipboard)
         self.tree.bind("<Control-V>", self.paste_from_clipboard)
         self.tree.bind("<Delete>", self.clear_selected_values)
         self.tree.bind("<BackSpace>", self.clear_selected_values)
         self.tree.bind("<Key>", self.start_typing_in_selected_cell)
+        self.register_drop_target(self.tree)
+        self.register_drop_target(table_frame)
 
     def set_server_status(self, text, color, ready=False):
         if self.closing:
@@ -340,6 +403,93 @@ class RTSPStreamerGUI:
         except OSError:
             return "MediaMTX가 시작 직후 종료되었습니다."
 
+    def update_source_mode_ui(self):
+        if self.source_mode_var.get() == "webcam":
+            self.btn_browse.pack_forget()
+            self.combo_webcam.pack(side="right", padx=5)
+            self.btn_refresh_webcam.pack(side="right", padx=5)
+            self.lbl_duration.config(text="웹캠 라이브 입력", fg="#555555")
+            if not self.webcam_devices:
+                self.refresh_webcam_devices(show_error=False)
+            elif self.webcam_var.get():
+                self.lbl_file.config(text=f"웹캠: {self.webcam_var.get()}", fg="black")
+        else:
+            self.combo_webcam.pack_forget()
+            self.btn_refresh_webcam.pack_forget()
+            self.btn_browse.pack(side="right", padx=5)
+            if self.video_path:
+                self.lbl_file.config(text=os.path.basename(self.video_path), fg="black")
+            else:
+                self.lbl_file.config(text="선택된 파일이 없습니다.", fg="gray")
+            if self.video_duration > 0:
+                self.lbl_duration.config(
+                    text=f"영상 길이: {self.format_time(self.video_duration)}", fg="#555555"
+                )
+            else:
+                self.lbl_duration.config(text="", fg="#555555")
+
+    def refresh_webcam_devices(self, show_error=True):
+        if not os.path.isfile(FFMPEG_PATH):
+            if show_error:
+                messagebox.showerror("실행 오류", "ffmpeg.exe를 찾을 수 없습니다.")
+            return
+
+        try:
+            result = subprocess.run(
+                [FFMPEG_PATH, "-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
+                cwd=CURRENT_DIR,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=CREATE_NO_WINDOW,
+                timeout=10,
+            )
+        except Exception as exc:
+            if show_error:
+                messagebox.showerror("웹캠 확인 실패", str(exc))
+            return
+
+        devices = self.parse_dshow_video_devices(result.stderr)
+        self.webcam_devices = devices
+        self.combo_webcam["values"] = devices
+        if devices and self.webcam_var.get() not in devices:
+            self.webcam_var.set(devices[0])
+            self.lbl_file.config(text=f"웹캠: {devices[0]}", fg="black")
+        elif not devices:
+            self.webcam_var.set("")
+            self.lbl_file.config(text="웹캠을 찾지 못했습니다.", fg="#dc2626")
+            if show_error:
+                messagebox.showwarning("웹캠 없음", "FFmpeg에서 인식한 웹캠 장치가 없습니다.")
+
+    @staticmethod
+    def parse_dshow_video_devices(text):
+        devices = []
+        in_video_section = False
+        for line in text.splitlines():
+            lowered = line.lower()
+            if "directshow video devices" in lowered:
+                in_video_section = True
+                continue
+            if "directshow audio devices" in lowered:
+                in_video_section = False
+                continue
+            if not in_video_section:
+                continue
+            match = re.search(r'"([^"]+)"', line)
+            if match:
+                name = match.group(1)
+                if name.startswith("@device_"):
+                    continue
+                if name not in devices:
+                    devices.append(name)
+        return devices
+
+    def on_webcam_selected(self, _event=None):
+        if self.webcam_var.get():
+            self.lbl_file.config(text=f"웹캠: {self.webcam_var.get()}", fg="black")
+
     def browse_file(self):
         selected_file = filedialog.askopenfilename(
             title="송출할 영상 선택",
@@ -364,6 +514,163 @@ class RTSPStreamerGUI:
             text=f"영상 길이: {self.format_time(self.video_duration)}", fg="#555555"
         )
         self.rebuild_schedule_from_ui()
+
+    def register_drop_target(self, widget):
+        if DND_FILES is None or not hasattr(widget, "drop_target_register"):
+            return
+        try:
+            widget.drop_target_register(DND_FILES)
+            widget.dnd_bind("<<Drop>>", self.handle_file_drop)
+        except tk.TclError:
+            pass
+
+    def handle_file_drop(self, event):
+        try:
+            paths = self.root.tk.splitlist(event.data)
+        except tk.TclError:
+            paths = [event.data]
+        if not paths:
+            return
+        self.import_level_values_from_path(paths[0])
+
+    def import_level_file(self):
+        selected_file = filedialog.askopenfilename(
+            title="수위값 파일 선택",
+            filetypes=[
+                ("엑셀/CSV 파일", "*.xlsx *.xlsm *.xltx *.xltm *.xls *.csv *.tsv *.txt"),
+                ("Excel 파일", "*.xlsx *.xlsm *.xltx *.xltm *.xls"),
+                ("CSV/텍스트 파일", "*.csv *.tsv *.txt"),
+                ("모든 파일", "*.*"),
+            ],
+        )
+        if selected_file:
+            self.import_level_values_from_path(selected_file)
+
+    def import_level_values_from_path(self, path):
+        if self.is_streaming:
+            messagebox.showwarning("불러오기 제한", "송출 중에는 수위값 파일을 불러올 수 없습니다.")
+            return
+
+        try:
+            values = self.read_level_values_file(path)
+        except Exception as exc:
+            messagebox.showerror("수위값 불러오기 실패", str(exc))
+            return
+
+        if self.skip_file_first_row_var.get() and values:
+            values = values[1:]
+
+        values = [value for value in values if str(value).strip() != ""]
+        if not values:
+            messagebox.showwarning("수위값 없음", "파일에서 불러올 수위값을 찾지 못했습니다.")
+            return
+
+        inserted = self.fill_values_from_selected_row(values)
+        messagebox.showinfo(
+            "수위값 불러오기",
+            f"{os.path.basename(path)} 파일에서 {inserted}개 값을 입력했습니다.",
+        )
+
+    def read_level_values_file(self, path):
+        ext = os.path.splitext(path)[1].lower()
+        if ext in (".xlsx", ".xlsm", ".xltx", ".xltm"):
+            return self.read_xlsx_values(path)
+        if ext == ".xls":
+            return self.read_xls_values(path)
+        if ext in (".csv", ".tsv", ".txt"):
+            return self.read_csv_values(path)
+        raise ValueError("지원하지 않는 파일 형식입니다. xlsx, xls, csv, tsv, txt 파일을 사용해 주세요.")
+
+    def read_xlsx_values(self, path):
+        workbook = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        try:
+            sheet = workbook.active
+            values = []
+            for row in sheet.iter_rows(values_only=True):
+                value = self.pick_value_from_row(row)
+                if value != "":
+                    values.append(value)
+            return values
+        finally:
+            workbook.close()
+
+    def read_xls_values(self, path):
+        workbook = xlrd.open_workbook(path)
+        sheet = workbook.sheet_by_index(0)
+        values = []
+        for row_index in range(sheet.nrows):
+            value = self.pick_value_from_row(sheet.row_values(row_index))
+            if value != "":
+                values.append(value)
+        return values
+
+    def read_csv_values(self, path):
+        last_error = None
+        for encoding in ("utf-8-sig", "cp949", "euc-kr", "utf-8"):
+            try:
+                with open(path, "r", encoding=encoding, newline="") as file:
+                    sample = file.read(4096)
+                    file.seek(0)
+                    try:
+                        dialect = csv.Sniffer().sniff(sample, delimiters=",\t;")
+                    except csv.Error:
+                        dialect = csv.excel_tab if path.lower().endswith(".tsv") else csv.excel
+                    reader = csv.reader(file, dialect)
+                    values = []
+                    for row in reader:
+                        value = self.pick_value_from_row(row)
+                        if value != "":
+                            values.append(value)
+                    return values
+            except UnicodeDecodeError as exc:
+                last_error = exc
+        raise ValueError(f"파일 인코딩을 읽지 못했습니다: {last_error}")
+
+    @staticmethod
+    def pick_value_from_row(row):
+        cells = []
+        for cell in row:
+            if cell is None:
+                continue
+            text = str(cell).strip()
+            if text != "":
+                cells.append(text)
+        return cells[-1] if cells else ""
+
+    def fill_values_from_selected_row(self, values):
+        if not self.schedule_rows:
+            if self.source_mode_var.get() == "webcam":
+                row_count = len(values) + (1 if self.skip_table_first_row_var.get() else 0)
+                if not self.rebuild_schedule_by_count(row_count):
+                    return 0
+            else:
+                messagebox.showwarning("표 없음", "먼저 영상 파일을 선택해서 시간표를 만들어 주세요.")
+                return 0
+
+        if not self.schedule_rows:
+            return 0
+
+        selected = self.tree.selection()
+        start_index = int(selected[0]) if selected else 0
+        if self.skip_table_first_row_var.get() and start_index == 0:
+            start_index = 1
+        inserted = 0
+
+        for offset, value in enumerate(values):
+            index = start_index + offset
+            if index >= len(self.schedule_rows):
+                break
+            value_text = str(value).strip()
+            self.schedule_rows[index]["value"] = value_text
+            self.tree.set(str(index), "value", value_text)
+            inserted += 1
+
+        if inserted:
+            item = str(start_index)
+            self.tree.selection_set(item)
+            self.tree.focus(item)
+            self.tree.see(item)
+        return inserted
 
     def load_recent_settings(self):
         try:
@@ -446,7 +753,9 @@ class RTSPStreamerGUI:
     def collect_settings(self):
         return {
             "version": 1,
+            "source_mode": self.source_mode_var.get(),
             "video_path": self.video_path,
+            "webcam_device": self.webcam_var.get(),
             "rtsp_url": self.entry_url.get().strip(),
             "db_enabled": self.db_enabled_var.get(),
             "db_name": self.entry_db_name.get().strip(),
@@ -482,7 +791,10 @@ class RTSPStreamerGUI:
 
     def apply_settings(self, data):
         self.finish_cell_edit(save=False)
+        source_mode = data.get("source_mode", "file")
+        self.source_mode_var.set(source_mode if source_mode in ("file", "webcam") else "file")
         self.video_path = str(data.get("video_path", "") or "")
+        self.webcam_var.set(str(data.get("webcam_device", "") or ""))
         if self.video_path:
             self.lbl_file.config(text=os.path.basename(self.video_path), fg="black")
         else:
@@ -501,6 +813,10 @@ class RTSPStreamerGUI:
             self.lbl_duration.config(text="영상 파일 없음/길이 확인 실패", fg="#dc2626")
         else:
             self.lbl_duration.config(text="", fg="#555555")
+
+        self.update_source_mode_ui()
+        if self.source_mode_var.get() == "webcam" and self.webcam_var.get():
+            self.lbl_file.config(text=f"웹캠: {self.webcam_var.get()}", fg="black")
 
         self.set_entry_value(self.entry_url, data.get("rtsp_url", DEFAULT_RTSP_URL))
         self.db_enabled_var.set(bool(data.get("db_enabled", True)))
@@ -562,20 +878,60 @@ class RTSPStreamerGUI:
         hours, minutes, seconds = match.groups()
         return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
 
-    def rebuild_schedule_from_ui(self):
-        if self.video_duration <= 0:
-            messagebox.showwarning("영상 확인", "먼저 영상 파일을 선택해 주세요.")
-            return
-
+    def get_interval_seconds_from_ui(self):
         try:
             interval_value = int(self.interval_value_var.get())
             if interval_value <= 0:
                 raise ValueError
         except ValueError:
             messagebox.showwarning("간격 확인", "간격은 1 이상의 숫자로 입력해 주세요.")
+            return None
+
+        return interval_value * 60 if self.interval_unit_var.get() == "분" else interval_value
+
+    def rebuild_schedule_by_count(self, row_count, interval_seconds=None):
+        if row_count <= 0:
+            return False
+        if interval_seconds is None:
+            interval_seconds = self.get_interval_seconds_from_ui()
+        if interval_seconds is None:
+            return False
+
+        old_values = [row.get("value", "") for row in self.schedule_rows]
+        rows = []
+        for index in range(row_count):
+            offset = index * interval_seconds
+            rows.append(
+                {
+                    "offset": float(offset),
+                    "time": self.format_time(offset),
+                    "value": old_values[index] if index < len(old_values) else "",
+                }
+            )
+        self.schedule_rows = rows
+        self.refresh_tree()
+        return True
+
+    def rebuild_schedule_from_ui(self):
+        interval_seconds = self.get_interval_seconds_from_ui()
+        if interval_seconds is None:
             return
 
-        interval_seconds = interval_value * 60 if self.interval_unit_var.get() == "분" else interval_value
+        if self.source_mode_var.get() == "webcam":
+            if not self.schedule_rows:
+                messagebox.showwarning(
+                    "표 없음",
+                    "웹캠은 영상 길이가 없어서 자동 시간표를 만들 수 없습니다.\n"
+                    "수위파일을 불러오면 값 개수에 맞춰 표가 자동 생성됩니다.",
+                )
+                return
+            self.rebuild_schedule_by_count(len(self.schedule_rows), interval_seconds)
+            return
+
+        if self.video_duration <= 0:
+            messagebox.showwarning("영상 확인", "먼저 영상 파일을 선택해 주세요.")
+            return
+
         old_values = {row["time"]: row.get("value", "") for row in self.schedule_rows}
 
         rows = []
@@ -771,6 +1127,37 @@ class RTSPStreamerGUI:
 
         return "break"
 
+    def get_selected_items_for_clipboard(self):
+        selected = list(self.tree.selection())
+        if not selected:
+            focused = self.tree.focus()
+            selected = [focused] if focused else []
+        return sorted(selected, key=lambda item: int(item))
+
+    def copy_selected_values(self, _event=None):
+        self.finish_cell_edit(save=True)
+        selected = self.get_selected_items_for_clipboard()
+        if not selected:
+            return "break"
+
+        values = []
+        for item in selected:
+            try:
+                index = int(item)
+            except ValueError:
+                continue
+            if 0 <= index < len(self.schedule_rows):
+                values.append(str(self.schedule_rows[index].get("value", "")))
+
+        self.root.clipboard_clear()
+        self.root.clipboard_append("\n".join(values))
+        return "break"
+
+    def cut_selected_values(self, _event=None):
+        self.copy_selected_values()
+        self.clear_selected_values()
+        return "break"
+
     def clear_selected_values(self, _event=None):
         self.finish_cell_edit(save=False)
         selected = self.tree.selection()
@@ -797,8 +1184,12 @@ class RTSPStreamerGUI:
 
     def start_streaming(self):
         self.finish_cell_edit(save=True)
-        if not os.path.isfile(self.video_path):
+        source_mode = self.source_mode_var.get()
+        if source_mode == "file" and not os.path.isfile(self.video_path):
             messagebox.showwarning("파일 확인", "먼저 송출할 영상 파일을 선택해 주세요.")
+            return
+        if source_mode == "webcam" and not self.webcam_var.get().strip():
+            messagebox.showwarning("웹캠 확인", "송출할 웹캠을 선택해 주세요.")
             return
         if not os.path.isfile(FFMPEG_PATH):
             messagebox.showerror("실행 오류", "ffmpeg.exe를 찾을 수 없습니다.")
@@ -822,6 +1213,8 @@ class RTSPStreamerGUI:
         self.is_streaming = True
         self.btn_action.config(text="연결 중...", bg="#d97706", state="disabled")
         self.btn_browse.config(state="disabled")
+        self.combo_webcam.config(state="disabled")
+        self.btn_refresh_webcam.config(state="disabled")
         self.entry_url.config(state="disabled")
         self.lbl_status.config(text="상태: RTSP 서버 연결 중...", fg="#d97706")
 
@@ -968,6 +1361,7 @@ class RTSPStreamerGUI:
         cycle_index = 0
         inserted = set()
         insert_count = 0
+        is_file_source = self.source_mode_var.get() == "file"
         duration = max(self.video_duration, 1.0)
 
         self.root.after(0, lambda: self.lbl_db_status.config(text="DB INSERT: 실행 중", fg="#16a34a"))
@@ -998,7 +1392,16 @@ class RTSPStreamerGUI:
                             ),
                         )
 
-            if elapsed >= (cycle_index + 1) * duration + 0.2:
+            if not is_file_source and len(inserted) >= len(rows):
+                self.root.after(
+                    0,
+                    lambda count=insert_count: self.lbl_db_status.config(
+                        text=f"DB INSERT: {count}건 입력 완료", fg="#16a34a"
+                    ),
+                )
+                break
+
+            if is_file_source and elapsed >= (cycle_index + 1) * duration + 0.2:
                 cycle_index += 1
                 inserted.clear()
 
@@ -1028,10 +1431,13 @@ class RTSPStreamerGUI:
             conn.commit()
 
     def _run_ffmpeg(self, rtsp_url):
-        attempts = [
-            self._build_ffmpeg_command(rtsp_url, repair_timestamps=False),
-            self._build_ffmpeg_command(rtsp_url, repair_timestamps=True),
-        ]
+        if self.source_mode_var.get() == "webcam":
+            attempts = [self._build_ffmpeg_command(rtsp_url, repair_timestamps=False)]
+        else:
+            attempts = [
+                self._build_ffmpeg_command(rtsp_url, repair_timestamps=False),
+                self._build_ffmpeg_command(rtsp_url, repair_timestamps=True),
+            ]
         last_error = ""
 
         try:
@@ -1068,11 +1474,26 @@ class RTSPStreamerGUI:
             "-loglevel",
             "warning",
             "-re",
-            "-stream_loop",
-            "-1",
         ]
 
-        if repair_timestamps:
+        if self.source_mode_var.get() == "webcam":
+            command.extend(
+                [
+                    "-f",
+                    "dshow",
+                    "-i",
+                    f"video={self.webcam_var.get()}",
+                ]
+            )
+        else:
+            command.extend(
+                [
+                    "-stream_loop",
+                    "-1",
+                ]
+            )
+
+        if repair_timestamps and self.source_mode_var.get() != "webcam":
             command.extend(
                 [
                     "-ignore_editlist",
@@ -1084,10 +1505,11 @@ class RTSPStreamerGUI:
                 ]
             )
 
+        if self.source_mode_var.get() != "webcam":
+            command.extend(["-i", self.video_path])
+
         command.extend(
             [
-                "-i",
-                self.video_path,
                 "-map",
                 "0:v:0",
                 "-map",
@@ -1202,6 +1624,8 @@ class RTSPStreamerGUI:
         self.is_streaming = False
         self.btn_action.config(text="송출 시작", bg="#16a34a", state="normal")
         self.btn_browse.config(state="normal")
+        self.combo_webcam.config(state="readonly")
+        self.btn_refresh_webcam.config(state="normal")
         self.entry_url.config(state="normal")
         self.lbl_status.config(text="상태: 대기 중", fg="#2563eb")
         if self.db_enabled_var.get():
@@ -1233,6 +1657,6 @@ class RTSPStreamerGUI:
 
 
 if __name__ == "__main__":
-    root = tk.Tk()
+    root = TkinterDnD.Tk() if TkinterDnD is not None else tk.Tk()
     RTSPStreamerGUI(root)
     root.mainloop()
