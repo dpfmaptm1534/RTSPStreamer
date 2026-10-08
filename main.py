@@ -469,6 +469,14 @@ class RTSPStreamerGUI:
         in_video_section = False
         for line in text.splitlines():
             lowered = line.lower()
+
+            typed_match = re.search(r'"([^"]+)"\s*\((video|audio)\)', line, re.IGNORECASE)
+            if typed_match:
+                name, device_type = typed_match.groups()
+                if device_type.lower() == "video" and name not in devices:
+                    devices.append(name)
+                continue
+
             if "directshow video devices" in lowered:
                 in_video_section = True
                 continue
