@@ -281,6 +281,7 @@ class RTSPStreamerGUI:
         db_frame.columnconfigure(3, weight=1)
 
         table_frame = tk.LabelFrame(mid_frame, text=" 4. 영상 시간별 수위값 표 ", padx=10, pady=8)
+        self.table_frame = table_frame
         table_frame.pack(fill="both", expand=True, pady=(8, 0))
 
         toolbar = tk.Frame(table_frame)
@@ -369,6 +370,15 @@ class RTSPStreamerGUI:
         self.tree.bind("<Leave>", self.enable_main_mousewheel)
         self.register_drop_target(self.tree)
         self.register_drop_target(table_frame)
+        self.update_time_table_labels()
+
+    def update_time_table_labels(self):
+        if self.source_mode_var.get() == "webcam":
+            self.table_frame.config(text=" 4. 송출 경과시간별 수위값 표 ")
+            self.tree.heading("time", text="경과시간")
+        else:
+            self.table_frame.config(text=" 4. 영상 시간별 수위값 표 ")
+            self.tree.heading("time", text="영상 시간")
 
     def update_main_scroll_region(self, _event=None):
         self.main_canvas.configure(scrollregion=self.main_canvas.bbox("all"))
@@ -479,6 +489,9 @@ class RTSPStreamerGUI:
             return "MediaMTX가 시작 직후 종료되었습니다."
 
     def update_source_mode_ui(self):
+        if hasattr(self, "table_frame"):
+            self.update_time_table_labels()
+
         if self.source_mode_var.get() == "webcam":
             self.btn_browse.pack_forget()
             self.combo_webcam.pack(side="right", padx=5)
@@ -1271,8 +1284,8 @@ class RTSPStreamerGUI:
             if not self.schedule_rows:
                 messagebox.showwarning(
                     "표 없음",
-                    "웹캠은 영상 길이가 없어서 자동 시간표를 만들 수 없습니다.\n"
-                    "수위파일을 불러오면 값 개수에 맞춰 표가 자동 생성됩니다.",
+                    "웹캠은 전체 길이를 알 수 없어서 빈 표를 자동 생성할 수 없습니다.\n"
+                    "수위파일을 불러오면 값 개수에 맞춰 송출 경과시간표가 자동 생성됩니다.",
                 )
                 return
             self.rebuild_schedule_by_count(len(self.schedule_rows), interval_seconds)
@@ -1953,7 +1966,10 @@ class RTSPStreamerGUI:
         if not self.is_streaming or self.closing:
             return
         self.btn_action.config(text="송출 중지", bg="#dc2626", state="normal")
-        self.lbl_status.config(text="상태: 송출 중 (영상 반복 재생)", fg="#16a34a")
+        if self.source_mode_var.get() == "webcam":
+            self.lbl_status.config(text="상태: 송출 중 (웹캠 라이브 / 경과시간 기준)", fg="#16a34a")
+        else:
+            self.lbl_status.config(text="상태: 송출 중 (영상 반복 재생)", fg="#16a34a")
 
     def _show_stream_error(self, detail):
         messagebox.showerror(
