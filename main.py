@@ -306,6 +306,10 @@ class RTSPStreamerGUI:
         tk.Button(toolbar, text="표 다시 만들기", command=self.rebuild_schedule_from_ui).pack(
             side="left", padx=8
         )
+        tk.Button(toolbar, text="행 추가", command=self.add_schedule_row).pack(side="left")
+        tk.Button(toolbar, text="선택 행 삭제", command=self.delete_selected_rows).pack(
+            side="left", padx=(6, 0)
+        )
         tk.Button(toolbar, text="수위값 비우기", command=self.clear_values).pack(side="left")
         tk.Button(toolbar, text="수위파일 불러오기", command=self.import_level_file).pack(
             side="left", padx=(8, 0)
@@ -1316,6 +1320,59 @@ class RTSPStreamerGUI:
 
         self.schedule_rows = rows
         self.refresh_tree()
+
+    def add_schedule_row(self):
+        interval_seconds = self.get_interval_seconds_from_ui()
+        if interval_seconds is None:
+            return
+
+        if self.schedule_rows:
+            last_offset = float(self.schedule_rows[-1].get("offset", 0) or 0)
+            next_offset = last_offset + interval_seconds
+        else:
+            next_offset = 0.0
+
+        self.schedule_rows.append(
+            {
+                "offset": float(next_offset),
+                "time": self.format_time(next_offset),
+                "value": "",
+            }
+        )
+        self.refresh_tree()
+        item = str(len(self.schedule_rows) - 1)
+        self.tree.selection_set(item)
+        self.tree.focus(item)
+        self.tree.see(item)
+
+    def delete_selected_rows(self):
+        self.finish_cell_edit(save=False)
+        selected = self.tree.selection()
+        if not selected:
+            focused = self.tree.focus()
+            selected = (focused,) if focused else ()
+        if not selected:
+            return
+
+        indexes = set()
+        for item in selected:
+            try:
+                indexes.add(int(item))
+            except ValueError:
+                continue
+
+        self.schedule_rows = [
+            row for index, row in enumerate(self.schedule_rows) if index not in indexes
+        ]
+        self.refresh_tree()
+
+        if self.schedule_rows:
+            next_index = min(indexes) if indexes else 0
+            next_index = min(next_index, len(self.schedule_rows) - 1)
+            item = str(next_index)
+            self.tree.selection_set(item)
+            self.tree.focus(item)
+            self.tree.see(item)
 
     def refresh_tree(self):
         self.finish_cell_edit(save=True)
