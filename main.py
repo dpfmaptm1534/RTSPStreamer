@@ -1,6 +1,7 @@
 import csv
 import json
 import os
+import queue
 import re
 import socket
 import subprocess
@@ -51,6 +52,11 @@ class RTSPStreamerGUI:
         self.video_duration = 0.0
         self.schedule_rows = []
         self.ffmpeg_process = None
+        self.preview_process = None
+        self.preview_thread = None
+        self.preview_image = None
+        self.preview_queue = queue.Queue()
+        self.preview_polling = False
         self.server_process = None
         self.server_log_file = None
         self.db_thread = None
@@ -92,6 +98,7 @@ class RTSPStreamerGUI:
 
         file_frame = tk.LabelFrame(top_frame, text=" 1. 입력 소스 선택 ", padx=10, pady=10)
         file_frame.pack(fill="x")
+        self.source_frame = file_frame
 
         self.source_mode_var = tk.StringVar(value="file")
         tk.Radiobutton(
@@ -130,6 +137,26 @@ class RTSPStreamerGUI:
 
         self.btn_browse = tk.Button(file_frame, text="파일 선택", width=11, command=self.browse_file)
         self.btn_browse.pack(side="right", padx=5)
+
+        self.preview_frame = tk.LabelFrame(top_frame, text=" 웹캠 미리보기 ", padx=10, pady=8)
+        self.lbl_preview = tk.Label(
+            self.preview_frame,
+            text="웹캠을 선택하면 여기에 미리보기가 표시됩니다.",
+            bg="black",
+            fg="white",
+            width=44,
+            height=10,
+            anchor="center",
+        )
+        self.lbl_preview.pack(side="left")
+        self.lbl_preview_status = tk.Label(
+            self.preview_frame,
+            text="",
+            fg="#555555",
+            anchor="w",
+            justify="left",
+        )
+        self.lbl_preview_status.pack(side="left", fill="x", expand=True, padx=12)
         self.update_source_mode_ui()
 
         url_frame = tk.LabelFrame(top_frame, text=" 2. RTSP 송출 주소 ", padx=10, pady=10)
@@ -408,12 +435,16 @@ class RTSPStreamerGUI:
             self.btn_browse.pack_forget()
             self.combo_webcam.pack(side="right", padx=5)
             self.btn_refresh_webcam.pack(side="right", padx=5)
+            self.preview_frame.pack(fill="x", pady=(6, 0), after=self.source_frame)
             self.lbl_duration.config(text="웹캠 라이브 입력", fg="#555555")
             if not self.webcam_devices:
                 self.refresh_webcam_devices(show_error=False)
             elif self.webcam_var.get():
                 self.lbl_file.config(text=f"웹캠: {self.webcam_var.get()}", fg="black")
+                self.start_webcam_preview()
         else:
+            self.stop_webcam_preview()
+            self.preview_frame.pack_forget()
             self.combo_webcam.pack_forget()
             self.btn_refresh_webcam.pack_forget()
             self.btn_browse.pack(side="right", padx=5)
@@ -457,11 +488,22 @@ class RTSPStreamerGUI:
         if devices and self.webcam_var.get() not in devices:
             self.webcam_var.set(devices[0])
             self.lbl_file.config(text=f"웹캠: {devices[0]}", fg="black")
+            self.start_webcam_preview()
         elif not devices:
+            self.stop_webcam_preview()
             self.webcam_var.set("")
             self.lbl_file.config(text="웹캠을 찾지 못했습니다.", fg="#dc2626")
+            self.lbl_preview.config(
+                image="",
+                text="웹캠을 찾지 못했습니다.",
+                bg="black",
+                fg="white",
+            )
+            self.lbl_preview_status.config(text="장치 연결 상태를 확인한 뒤 웹캠 새로고침을 눌러 주세요.", fg="#dc2626")
             if show_error:
                 messagebox.showwarning("웹캠 없음", "FFmpeg에서 인식한 웹캠 장치가 없습니다.")
+        elif self.source_mode_var.get() == "webcam":
+            self.start_webcam_preview()
 
     @staticmethod
     def parse_dshow_video_devices(text):
@@ -497,6 +539,230 @@ class RTSPStreamerGUI:
     def on_webcam_selected(self, _event=None):
         if self.webcam_var.get():
             self.lbl_file.config(text=f"웹캠: {self.webcam_var.get()}", fg="black")
+            self.start_webcam_preview()
+
+    def start_webcam_preview(self):
+        if self.closing or self.is_streaming or self.source_mode_var.get() != "webcam":
+            return
+
+        device_name = self.webcam_var.get().strip()
+        if not device_name:
+            return
+        if not os.path.isfile(FFMPEG_PATH):
+            self.lbl_preview_status.config(text="ffmpeg.exe를 찾을 수 없어 미리보기를 실행할 수 없습니다.", fg="#dc2626")
+            return
+
+        if (
+            self.preview_process
+            and self.preview_process.poll() is None
+            and getattr(self.preview_process, "device_name", None) == device_name
+        ):
+            return
+
+        self.stop_webcam_preview(clear_image=False)
+        self.lbl_preview.config(
+            image="",
+            text="웹캠 미리보기 연결 중...",
+            bg="black",
+            fg="white",
+        )
+        self.lbl_preview_status.config(
+            text="선택한 웹캠 화면을 확인하는 중입니다.\n송출 시작 시 미리보기는 자동 중지됩니다.",
+            fg="#555555",
+        )
+
+        command = [
+            FFMPEG_PATH,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "dshow",
+            "-i",
+            f"video={device_name}",
+            "-an",
+            "-vf",
+            "fps=5,scale=320:-1",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "ppm",
+            "pipe:1",
+        ]
+
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=CURRENT_DIR,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                creationflags=CREATE_NO_WINDOW,
+            )
+        except Exception as exc:
+            self.lbl_preview_status.config(text=f"웹캠 미리보기 시작 실패: {exc}", fg="#dc2626")
+            return
+
+        process.device_name = device_name
+        self.preview_process = process
+        self.preview_thread = threading.Thread(
+            target=self._run_webcam_preview,
+            args=(process, device_name),
+            daemon=True,
+        )
+        self.preview_thread.start()
+        self.schedule_preview_poll()
+
+    def stop_webcam_preview(self, clear_image=True):
+        process = self.preview_process
+        self.preview_process = None
+        if process and process.poll() is None:
+            try:
+                process.terminate()
+                process.wait(timeout=1)
+            except (subprocess.TimeoutExpired, OSError):
+                try:
+                    process.kill()
+                    process.wait(timeout=1)
+                except OSError:
+                    pass
+
+        if clear_image and hasattr(self, "lbl_preview"):
+            self.preview_image = None
+            self.lbl_preview.config(
+                image="",
+                text="웹캠을 선택하면 여기에 미리보기가 표시됩니다.",
+                bg="black",
+                fg="white",
+            )
+            self.lbl_preview_status.config(text="", fg="#555555")
+
+    def _run_webcam_preview(self, process, device_name):
+        last_error = ""
+        try:
+            while not self.closing and process.poll() is None and self.preview_process is process:
+                frame = self._read_ppm_frame(process.stdout)
+                if frame is None:
+                    break
+                self.preview_queue.put(("frame", process, frame))
+        except Exception as exc:
+            last_error = str(exc)
+        finally:
+            if process.poll() is None:
+                try:
+                    process.terminate()
+                    process.wait(timeout=1)
+                except (subprocess.TimeoutExpired, OSError):
+                    try:
+                        process.kill()
+                        process.wait(timeout=1)
+                    except OSError:
+                        pass
+
+            if process.stderr:
+                try:
+                    error_bytes = process.stderr.read()
+                    if error_bytes:
+                        last_error = error_bytes.decode("utf-8", errors="replace").strip() or last_error
+                except OSError:
+                    pass
+
+            if not self.closing and self.preview_process is process:
+                self.preview_process = None
+                self.preview_queue.put(("stopped", process, device_name, last_error))
+
+    def schedule_preview_poll(self):
+        if self.closing or self.preview_polling:
+            return
+        self.preview_polling = True
+        self.root.after(50, self.poll_preview_queue)
+
+    def poll_preview_queue(self):
+        self.preview_polling = False
+        while True:
+            try:
+                event = self.preview_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            event_type = event[0]
+            if event_type == "frame":
+                _, process, frame = event
+                self._show_preview_frame(process, frame)
+            elif event_type == "stopped":
+                _, _process, device_name, error_text = event
+                self._show_preview_stopped(device_name, error_text)
+
+        if not self.closing and (self.preview_process or not self.preview_queue.empty()):
+            self.schedule_preview_poll()
+
+    def _show_preview_frame(self, process, ppm_data):
+        if self.closing or self.preview_process is not process:
+            return
+        try:
+            self.preview_image = tk.PhotoImage(data=ppm_data, format="PPM")
+            self.lbl_preview.config(image=self.preview_image, text="")
+            self.lbl_preview_status.config(
+                text=f"미리보기 정상 표시 중\n장치: {self.webcam_var.get()}",
+                fg="#16a34a",
+            )
+        except tk.TclError as exc:
+            self.lbl_preview_status.config(text=f"미리보기 표시 실패: {exc}", fg="#dc2626")
+
+    def _show_preview_stopped(self, device_name, error_text):
+        if self.closing or self.source_mode_var.get() != "webcam" or self.webcam_var.get() != device_name:
+            return
+        detail = error_text.strip()
+        if detail:
+            detail = detail[-500:]
+            message = f"미리보기 실패\n{detail}"
+        else:
+            message = "미리보기가 중지되었습니다."
+        self.preview_image = None
+        self.lbl_preview.config(image="", text="웹캠 미리보기 없음", bg="black", fg="white")
+        self.lbl_preview_status.config(text=message, fg="#dc2626" if error_text else "#555555")
+
+    @classmethod
+    def _read_ppm_frame(cls, stream):
+        magic = cls._read_ppm_token(stream)
+        if not magic:
+            return None
+        if magic != b"P6":
+            return None
+        width = cls._read_ppm_token(stream)
+        height = cls._read_ppm_token(stream)
+        max_value = cls._read_ppm_token(stream)
+        if not width or not height or max_value != b"255":
+            return None
+
+        frame_size = int(width) * int(height) * 3
+        pixels = stream.read(frame_size)
+        if len(pixels) != frame_size:
+            return None
+        return b"P6\n" + width + b" " + height + b"\n255\n" + pixels
+
+    @staticmethod
+    def _read_ppm_token(stream):
+        token = bytearray()
+        while True:
+            char = stream.read(1)
+            if not char:
+                return None
+            if char == b"#":
+                stream.readline()
+                continue
+            if char in b" \t\r\n":
+                continue
+            token.extend(char)
+            break
+
+        while True:
+            char = stream.read(1)
+            if not char:
+                break
+            if char in b" \t\r\n":
+                break
+            token.extend(char)
+        return bytes(token)
 
     def browse_file(self):
         selected_file = filedialog.askopenfilename(
@@ -1218,6 +1484,13 @@ class RTSPStreamerGUI:
                 messagebox.showerror("DB 설정 오류", str(exc))
                 return
 
+        if source_mode == "webcam":
+            self.stop_webcam_preview(clear_image=False)
+            self.lbl_preview_status.config(
+                text="송출 중에는 카메라 충돌 방지를 위해 미리보기를 잠시 중지합니다.",
+                fg="#d97706",
+            )
+
         self.is_streaming = True
         self.btn_action.config(text="연결 중...", bg="#d97706", state="disabled")
         self.btn_browse.config(state="disabled")
@@ -1622,6 +1895,7 @@ class RTSPStreamerGUI:
             except (subprocess.TimeoutExpired, OSError):
                 try:
                     process.kill()
+                    process.wait(timeout=1)
                 except OSError:
                     pass
         self._reset_stream_ui()
@@ -1638,10 +1912,13 @@ class RTSPStreamerGUI:
         self.lbl_status.config(text="상태: 대기 중", fg="#2563eb")
         if self.db_enabled_var.get():
             self.lbl_db_status.config(text="DB INSERT: 대기", fg="#555555")
+        if self.source_mode_var.get() == "webcam" and self.webcam_var.get():
+            self.start_webcam_preview()
 
     def close(self):
         self.closing = True
         self.is_streaming = False
+        self.stop_webcam_preview(clear_image=False)
 
         if self.ffmpeg_process and self.ffmpeg_process.poll() is None:
             try:
