@@ -436,11 +436,17 @@ class RTSPStreamerGUI:
             self.combo_webcam.pack(side="right", padx=5)
             self.btn_refresh_webcam.pack(side="right", padx=5)
             self.preview_frame.pack(fill="x", pady=(6, 0), after=self.source_frame)
+            self.lbl_file.config(text="웹캠 검색 중...", fg="#555555")
             self.lbl_duration.config(text="웹캠 라이브 입력", fg="#555555")
-            if not self.webcam_devices:
+            current_device = self.webcam_var.get().strip()
+            if self.webcam_devices and current_device not in self.webcam_devices:
+                current_device = self.webcam_devices[0]
+                self.webcam_var.set(current_device)
+
+            if not self.webcam_devices or not current_device:
                 self.refresh_webcam_devices(show_error=False)
-            elif self.webcam_var.get():
-                self.lbl_file.config(text=f"웹캠: {self.webcam_var.get()}", fg="black")
+            elif current_device:
+                self.lbl_file.config(text=f"웹캠: {current_device}", fg="black")
                 self.start_webcam_preview()
         else:
             self.stop_webcam_preview()
@@ -489,6 +495,9 @@ class RTSPStreamerGUI:
             self.webcam_var.set(devices[0])
             self.lbl_file.config(text=f"웹캠: {devices[0]}", fg="black")
             self.start_webcam_preview()
+        elif devices and self.webcam_var.get() in devices:
+            self.lbl_file.config(text=f"웹캠: {self.webcam_var.get()}", fg="black")
+            self.start_webcam_preview()
         elif not devices:
             self.stop_webcam_preview()
             self.webcam_var.set("")
@@ -498,8 +507,8 @@ class RTSPStreamerGUI:
                 text="웹캠을 찾지 못했습니다.",
                 bg="black",
                 fg="white",
-            width=44,
-            height=10,
+                width=44,
+                height=10,
             )
             self.lbl_preview_status.config(text="장치 연결 상태를 확인한 뒤 웹캠 새로고침을 눌러 주세요.", fg="#dc2626")
             if show_error:
@@ -1043,11 +1052,12 @@ class RTSPStreamerGUI:
         self.apply_settings_file(self.recent_settings[selected_index])
 
     def collect_settings(self):
+        source_mode = self.source_mode_var.get()
         return {
             "version": 1,
-            "source_mode": self.source_mode_var.get(),
-            "video_path": self.video_path,
-            "webcam_device": self.webcam_var.get(),
+            "source_mode": source_mode,
+            "video_path": self.video_path if source_mode == "file" else "",
+            "webcam_device": self.webcam_var.get() if source_mode == "webcam" else "",
             "rtsp_url": self.entry_url.get().strip(),
             "db_enabled": self.db_enabled_var.get(),
             "db_name": self.entry_db_name.get().strip(),
