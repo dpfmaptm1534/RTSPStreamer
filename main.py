@@ -1742,12 +1742,12 @@ class RTSPStreamerGUI:
         self.edit_entry = tk.Entry(self.tree)
         if initial_text is None:
             self.edit_entry.insert(0, value)
+            self.edit_entry.select_range(0, tk.END)
         elif append:
             self.edit_entry.insert(0, value + initial_text)
+            self.edit_entry.icursor(tk.END)
         else:
             self.edit_entry.insert(0, initial_text)
-        self.edit_entry.select_range(0, tk.END)
-        if initial_text is not None:
             self.edit_entry.icursor(tk.END)
         self.edit_entry.focus_set()
         self.edit_entry.place(x=x, y=y, width=width, height=height)
