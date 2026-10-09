@@ -14,6 +14,7 @@ rtsp://127.0.0.1:8554/live/stream
 - MP4, AVI, MKV, MOV, WMV, WebM, TS 영상 지원
 - PC에 연결된 웹캠 DirectShow 장치 송출 지원
 - 웹캠 선택 시 작은 라이브 미리보기 표시
+- 웹캠 송출 중 FFmpeg가 순간 중단되면 자동 재연결
 - 영상 무한 반복 송출
 - H.264 영상 및 AAC 오디오 송출
 - 내장 MediaMTX RTSP 서버 자동 실행
