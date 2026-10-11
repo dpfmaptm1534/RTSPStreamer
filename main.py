@@ -1759,6 +1759,7 @@ class RTSPStreamerGUI:
         self.edit_entry.bind("<Tab>", lambda _event: self.move_from_editor(0, 1))
         self.edit_entry.bind("<Shift-Tab>", lambda _event: self.move_from_editor(0, -1))
         self.edit_entry.bind("<Escape>", lambda _event: self.finish_cell_edit(save=False))
+        self.edit_entry.bind("<KeyRelease>", self.sync_live_cell_edit)
         self.edit_entry.bind("<FocusOut>", lambda _event: self.finish_cell_edit(save=True))
 
     def start_typing_in_selected_cell(self, event):
@@ -1820,6 +1821,23 @@ class RTSPStreamerGUI:
                         self.tree.set(item, "value", value)
         entry.destroy()
         self.root.after_idle(self.draw_active_cell_border)
+
+    def sync_live_cell_edit(self, _event=None):
+        if not self.edit_entry or not hasattr(self.edit_entry, "item_id"):
+            return
+        entry = self.edit_entry
+        if getattr(entry, "column_name", "value") != "value":
+            return
+        try:
+            index = int(entry.item_id)
+        except (TypeError, ValueError):
+            return
+        if not (0 <= index < len(self.schedule_rows)):
+            return
+        value = entry.get().strip()
+        self.schedule_rows[index]["value"] = value
+        if entry.item_id in self.tree.get_children():
+            self.tree.set(entry.item_id, "value", value)
 
     @staticmethod
     def parse_time_text(text):
@@ -2187,20 +2205,6 @@ class RTSPStreamerGUI:
             time.sleep(0.25)
 
     def _run_db_scheduler(self):
-        rows = [
-            dict(row)
-            for row in self.schedule_rows
-            if str(row.get("value", "")).strip() != ""
-        ]
-        if not rows:
-            self.root.after(
-                0,
-                lambda: self.lbl_db_status.config(
-                    text="DB INSERT: 입력할 수위값 없음", fg="#d97706"
-                ),
-            )
-            return
-
         config = self.get_db_config()
         start_mono = time.monotonic()
         cycle_index = 0
@@ -2209,14 +2213,30 @@ class RTSPStreamerGUI:
         is_file_source = self.streaming_source_mode == "file"
         duration = max(self.video_duration, 1.0)
         interval_seconds = max(float(self.streaming_interval_seconds), 1.0)
+        last_auto_extend_offset = None
 
         self.root.after(0, lambda: self.lbl_db_status.config(text="DB INSERT: 실행 중", fg="#16a34a"))
 
         while self.is_streaming and not self.closing:
             elapsed = time.monotonic() - start_mono
             cycle_start = cycle_index * duration
+            rows = [
+                (row_index, dict(row))
+                for row_index, row in enumerate(self.schedule_rows)
+                if str(row.get("value", "")).strip() != ""
+            ]
 
-            for row_index, row in enumerate(rows):
+            if not rows:
+                self.root.after(
+                    0,
+                    lambda: self.lbl_db_status.config(
+                        text="DB INSERT: 입력할 수위값 없음", fg="#d97706"
+                    ),
+                )
+                time.sleep(0.5)
+                continue
+
+            for row_index, row in rows:
                 key = (cycle_index, row_index)
                 target = cycle_start + float(row["offset"])
                 if key not in inserted and elapsed >= target:
@@ -2238,16 +2258,15 @@ class RTSPStreamerGUI:
                             ),
                         )
 
-            if not is_file_source and len(inserted) >= len(rows):
-                last_row = rows[-1]
+            current_keys = {(cycle_index, row_index) for row_index, _row in rows}
+            if not is_file_source and current_keys and current_keys.issubset(inserted):
+                _last_index, last_row = rows[-1]
                 next_offset = float(last_row.get("offset", 0) or 0) + interval_seconds
+                if next_offset == last_auto_extend_offset:
+                    time.sleep(0.1)
+                    continue
+                last_auto_extend_offset = next_offset
                 carry_value = str(last_row.get("value", "")).strip()
-                next_row = {
-                    "offset": float(next_offset),
-                    "time": self.format_time(next_offset),
-                    "value": carry_value,
-                }
-                rows.append(next_row)
                 self.root.after(
                     0,
                     lambda offset=next_offset, value=carry_value: self.append_schedule_row_direct(offset, value),
