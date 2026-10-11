@@ -2292,31 +2292,54 @@ class RTSPStreamerGUI:
         if self.streaming_source_mode == "webcam":
             self._run_webcam_ffmpeg_loop(rtsp_url)
             return
+        self._run_file_ffmpeg_loop(rtsp_url)
 
-        attempts = [
-            self._build_ffmpeg_command(rtsp_url, repair_timestamps=False),
-            self._build_ffmpeg_command(rtsp_url, repair_timestamps=True),
-        ]
+    def _run_file_ffmpeg_loop(self, rtsp_url):
+        consecutive_quick_failures = 0
         last_error = ""
 
         try:
-            for attempt_number, command in enumerate(attempts):
+            while self.is_streaming and not self.closing:
+                attempts = [
+                    self._build_ffmpeg_command(rtsp_url, repair_timestamps=False),
+                    self._build_ffmpeg_command(rtsp_url, repair_timestamps=True),
+                ]
+                longest_run_seconds = 0.0
+
+                for attempt_number, command in enumerate(attempts):
+                    if not self.is_streaming or self.closing:
+                        return
+                    if attempt_number == 1:
+                        self.root.after(0, self._mark_repairing)
+
+                    started_at = time.monotonic()
+                    return_code, error_text = self._execute_ffmpeg(command)
+                    run_seconds = time.monotonic() - started_at
+                    longest_run_seconds = max(longest_run_seconds, run_seconds)
+                    last_error = error_text
+
+                    if not self.is_streaming or self.closing:
+                        return
+                    if attempt_number == 0 and return_code != 0 and self._is_timestamp_error(error_text):
+                        continue
+                    break
+
                 if not self.is_streaming or self.closing:
                     return
-                if attempt_number == 1:
-                    self.root.after(0, self._mark_repairing)
 
-                return_code, error_text = self._execute_ffmpeg(command)
-                last_error = error_text
+                if longest_run_seconds < 5:
+                    consecutive_quick_failures += 1
+                else:
+                    consecutive_quick_failures = 0
 
-                if return_code == 0 or not self.is_streaming or self.closing:
-                    return
-                if attempt_number == 0 and self._is_timestamp_error(error_text):
-                    continue
-                break
+                if consecutive_quick_failures >= 3:
+                    break
+
+                self.root.after(0, self._mark_file_restarting)
+                time.sleep(1.5)
 
             if self.is_streaming and not self.closing:
-                detail = last_error.strip() or "FFmpeg가 오류 코드와 함께 종료되었습니다."
+                detail = last_error.strip() or "영상 파일 송출이 반복해서 중단되었습니다."
                 self.root.after(0, lambda: self._show_stream_error(detail[-4000:]))
         except Exception as exc:
             if not self.closing:
@@ -2431,22 +2454,6 @@ class RTSPStreamerGUI:
             ]
         )
 
-        if self.streaming_source_mode != "webcam":
-            command.extend(
-                [
-                    "-map",
-                    "0:a:0?",
-                    "-c:a",
-                    "aac",
-                    "-b:a",
-                    "128k",
-                    "-ar",
-                    "48000",
-                    "-ac",
-                    "2",
-                ]
-            )
-
         command.extend(
             [
                 "-f",
@@ -2503,6 +2510,14 @@ class RTSPStreamerGUI:
         self.btn_action.config(text="복구 재시도 중...", bg="#d97706", state="disabled")
         self.lbl_status.config(
             text="상태: 영상 타임스탬프를 복구하여 다시 연결 중...", fg="#d97706"
+        )
+
+    def _mark_file_restarting(self):
+        if not self.is_streaming or self.closing:
+            return
+        self.btn_action.config(text="영상 재연결 중...", bg="#d97706", state="disabled")
+        self.lbl_status.config(
+            text="상태: 영상 송출이 중단되어 자동 재연결 중...", fg="#d97706"
         )
 
     def _mark_webcam_restarting(self):
