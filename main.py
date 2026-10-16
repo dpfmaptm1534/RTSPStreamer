@@ -1,4 +1,5 @@
 import csv
+from collections import deque
 import json
 import os
 import queue
@@ -50,6 +51,9 @@ class RTSPStreamerGUI:
         self.video_path = ""
         self.webcam_devices = []
         self.video_duration = 0.0
+        self.video_frame_rate = 30.0
+        self.stream_progress = None
+        self.stream_attempt = 0
         self.schedule_rows = []
         self.ffmpeg_process = None
         self.preview_process = None
@@ -1258,6 +1262,7 @@ class RTSPStreamerGUI:
         entry.insert(0, str(value or ""))
 
     def get_video_duration(self, path):
+        self.video_frame_rate = 30.0
         try:
             result = subprocess.run(
                 [FFMPEG_PATH, "-hide_banner", "-i", path],
@@ -1273,11 +1278,36 @@ class RTSPStreamerGUI:
         except Exception:
             return 0.0
 
+        video_line = next((line for line in result.stderr.splitlines() if "Video:" in line), "")
+        # tbr is the nominal rate; average fps can be much lower when packet
+        # timestamps contain a long gap, which is precisely what we repair.
+        rate_match = re.search(r"(\d+(?:\.\d+)?) tbr", video_line)
+        if not rate_match:
+            rate_match = re.search(r"(\d+(?:\.\d+)?) fps", video_line)
+        if rate_match and float(rate_match.group(1)) > 0:
+            self.video_frame_rate = float(rate_match.group(1))
         match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", result.stderr)
         if not match:
             return 0.0
         hours, minutes, seconds = match.groups()
-        return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+        container_duration = int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+        try:
+            # Count video packets without decoding. Audio/data tracks and gaps in
+            # container timestamps must not extend our video-only loop clock.
+            scan = subprocess.run(
+                [FFMPEG_PATH, "-hide_banner", "-loglevel", "error", "-nostdin",
+                 "-nostats", "-progress", "pipe:1", "-i", path,
+                 "-map", "0:v:0", "-c:v", "copy", "-f", "null", "-"],
+                cwd=CURRENT_DIR, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, encoding="utf-8", errors="replace",
+                creationflags=CREATE_NO_WINDOW, timeout=30,
+            )
+            frame_counts = re.findall(r"^frame=(\d+)$", scan.stdout, re.MULTILINE)
+            if scan.returncode == 0 and frame_counts and int(frame_counts[-1]) > 0:
+                return int(frame_counts[-1]) / self.video_frame_rate
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        return container_duration
 
     def get_interval_seconds_from_ui(self):
         try:
@@ -2059,6 +2089,10 @@ class RTSPStreamerGUI:
         self.streaming_interval_seconds = interval_seconds
         self.streaming_webcam_device = self.webcam_var.get().strip()
         self.streaming_video_path = self.video_path
+        self.streaming_video_duration = self.video_duration
+        self.streaming_frame_rate = self.video_frame_rate
+        self.stream_progress = None
+        self.stream_attempt = 0
         self.btn_action.config(text="연결 중...", bg="#d97706", state="disabled")
         self.btn_browse.config(state="disabled")
         self.combo_webcam.config(state="disabled")
@@ -2195,12 +2229,16 @@ class RTSPStreamerGUI:
     def _run_elapsed_highlight(self):
         start_mono = time.monotonic()
         is_file_source = self.streaming_source_mode == "file"
-        duration = max(self.video_duration, 1.0)
+        duration = max(self.streaming_video_duration, 0.001)
 
         while self.is_streaming and not self.closing:
             elapsed = time.monotonic() - start_mono
-            display_elapsed = elapsed % duration if is_file_source and duration > 0 else elapsed
-            row_index = self.get_elapsed_row_index(display_elapsed)
+            progress = self.stream_progress
+            if is_file_source and progress is None:
+                row_index = None
+            else:
+                display_elapsed = progress[1] % duration if is_file_source else elapsed
+                row_index = self.get_elapsed_row_index(display_elapsed)
             self.root.after(0, lambda idx=row_index: self.set_elapsed_highlight(idx))
             time.sleep(0.25)
 
@@ -2211,15 +2249,45 @@ class RTSPStreamerGUI:
         inserted = set()
         insert_count = 0
         is_file_source = self.streaming_source_mode == "file"
-        duration = max(self.video_duration, 1.0)
+        duration = max(self.streaming_video_duration, 0.001)
         interval_seconds = max(float(self.streaming_interval_seconds), 1.0)
         last_auto_extend_offset = None
+        previous_file_position = None
 
         self.root.after(0, lambda: self.lbl_db_status.config(text="DB INSERT: 실행 중", fg="#16a34a"))
 
         while self.is_streaming and not self.closing:
             elapsed = time.monotonic() - start_mono
-            cycle_start = cycle_index * duration
+            if is_file_source:
+                progress = self.stream_progress
+                if progress is None:
+                    time.sleep(0.1)
+                    continue
+                attempt, elapsed = progress
+                cycle_index = int(elapsed // duration)
+                if previous_file_position is not None:
+                    previous_attempt, previous_cycle = previous_file_position
+                    if attempt != previous_attempt:
+                        inserted.clear()
+                    elif cycle_index != previous_cycle:
+                        # The table includes an endpoint row at exactly the duration.
+                        # Insert it at the boundary before starting the next cycle.
+                        for index, endpoint in enumerate(self.schedule_rows):
+                            is_endpoint = abs(float(endpoint["offset"]) - duration) < 0.001
+                            has_value = str(endpoint.get("value", "")).strip()
+                            if (previous_cycle, index) not in inserted and is_endpoint and has_value:
+                                try:
+                                    self.insert_db_row(config, dict(endpoint))
+                                    insert_count += 1
+                                except Exception as exc:
+                                    self.root.after(
+                                        0, lambda err=str(exc): self.lbl_db_status.config(
+                                            text=f"DB INSERT 오류: {err[:80]}", fg="#dc2626"
+                                        )
+                                    )
+                        inserted.clear()
+                previous_file_position = (attempt, cycle_index)
+            cycle_start = cycle_index * duration if is_file_source else 0.0
             rows = [
                 (row_index, dict(row))
                 for row_index, row in enumerate(self.schedule_rows)
@@ -2277,10 +2345,6 @@ class RTSPStreamerGUI:
                         text=f"DB INSERT: {count}건 입력 (마지막 수위값 자동 연장 중)", fg="#16a34a"
                     ),
                 )
-
-            if is_file_source and elapsed >= (cycle_index + 1) * duration + 0.2:
-                cycle_index += 1
-                inserted.clear()
 
             time.sleep(0.1)
 
@@ -2411,6 +2475,12 @@ class RTSPStreamerGUI:
             "-hide_banner",
             "-loglevel",
             "error" if self.streaming_source_mode == "webcam" else "warning",
+            "-nostdin",
+            "-nostats",
+            "-stats_period",
+            "0.25",
+            "-progress",
+            "pipe:1",
         ]
 
         if self.streaming_source_mode == "webcam":
@@ -2431,9 +2501,10 @@ class RTSPStreamerGUI:
         else:
             command.extend(
                 [
-                    "-re",
                     "-stream_loop",
                     "-1",
+                    "-fflags",
+                    "+genpts+discardcorrupt",
                 ]
             )
 
@@ -2450,7 +2521,15 @@ class RTSPStreamerGUI:
             )
 
         if self.streaming_source_mode != "webcam":
-            command.extend(["-i", self.streaming_video_path])
+            command.extend(["-an", "-sn", "-dn", "-i", self.streaming_video_path])
+            frame_rate = getattr(self, "streaming_frame_rate", 30.0)
+            # Pace decoded frames after rebuilding their timestamps. Input -re
+            # would still wait on broken packet timestamps at a loop boundary.
+            command.extend([
+                "-vf", f"setpts=N/({frame_rate:.10g}*TB):strip_fps=1,realtime",
+                "-r", f"{frame_rate:.10g}",
+                "-fps_mode", "cfr",
+            ])
 
         command.extend(
             [
@@ -2485,30 +2564,122 @@ class RTSPStreamerGUI:
         return command
 
     def _execute_ffmpeg(self, command):
-        self.ffmpeg_process = subprocess.Popen(
+        self.stream_attempt += 1
+        attempt = self.stream_attempt
+        self.stream_progress = None
+        process = subprocess.Popen(
             command,
             cwd=CURRENT_DIR,
-            stdout=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             creationflags=CREATE_NO_WINDOW,
         )
+        self.ffmpeg_process = process
+        errors = deque(maxlen=200)
+        started_at = time.monotonic()
+        progress_state = {"last_advance": started_at, "seconds": -1.0}
+        reader_errors = []
 
-        time.sleep(1)
-        if self.ffmpeg_process.poll() is None and self.is_streaming:
-            self.root.after(0, self._mark_streaming)
+        def read_progress():
+            block = {}
+            for raw_line in process.stdout:
+                key, _, value = raw_line.decode("utf-8", errors="replace").strip().partition("=")
+                block[key] = value
+                if key != "progress":
+                    continue
+                try:
+                    seconds = max(0.0, int(block["out_time_us"]) / 1_000_000)
+                    frames = int(block.get("frame", "0"))
+                except (KeyError, ValueError):
+                    block = {}
+                    continue
+                if frames > 0 and seconds > progress_state["seconds"]:
+                    first_frame = progress_state["seconds"] < 0
+                    progress_state["seconds"] = seconds
+                    progress_state["last_advance"] = time.monotonic()
+                    if self.is_streaming and not self.closing and self.ffmpeg_process is process:
+                        self.stream_progress = (attempt, seconds)
+                        if first_frame:
+                            self.root.after(0, self._mark_streaming)
+                block = {}
 
-        _, stderr = self.ffmpeg_process.communicate()
-        return_code = self.ffmpeg_process.returncode
-        error_text = stderr.decode("utf-8", errors="replace").strip()
+        def read_errors():
+            try:
+                log = open(FFMPEG_LOG_PATH, "w", encoding="utf-8", errors="replace")
+            except OSError:
+                log = None
+            try:
+                for raw_line in process.stderr:
+                    line = raw_line.decode("utf-8", errors="replace")
+                    errors.append(line)
+                    if log:
+                        try:
+                            log.write(line)
+                            log.flush()
+                        except OSError:
+                            log.close()
+                            log = None
+            finally:
+                if log:
+                    log.close()
 
+        def run_reader(reader):
+            try:
+                reader()
+            except Exception as exc:
+                reader_errors.append(str(exc))
+
+        readers = [
+            threading.Thread(target=run_reader, args=(reader,), daemon=True)
+            for reader in (read_progress, read_errors)
+        ]
+        for reader in readers:
+            reader.start()
+
+        stalled = False
         try:
-            with open(FFMPEG_LOG_PATH, "w", encoding="utf-8", errors="replace") as log:
-                log.write(error_text)
-        except OSError:
-            pass
+            while process.poll() is None:
+                if not self.is_streaming or self.closing or reader_errors:
+                    break
+                # A live process can be stuck without producing any more frames.
+                if self.streaming_source_mode == "file":
+                    timeout = (
+                        30.0 if progress_state["seconds"] < 0
+                        else max(15.0, 3.0 / self.streaming_frame_rate)
+                    )
+                    if time.monotonic() - progress_state["last_advance"] > timeout:
+                        stalled = True
+                        break
+                time.sleep(0.1)
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+            for reader in readers:
+                reader.join(timeout=3)
+            process.stdout.close()
+            process.stderr.close()
+            if self.ffmpeg_process is process:
+                self.ffmpeg_process = None
+                self.stream_progress = None
 
-        self.ffmpeg_process = None
-        return return_code, error_text
+        error_text = "".join(errors).strip()
+        if stalled:
+            error_text += "\n영상 프레임 송출이 멈춰 FFmpeg를 자동 재시작합니다."
+        if reader_errors:
+            error_text += "\n" + "\n".join(reader_errors)
+        if stalled or reader_errors:
+            try:
+                with open(FFMPEG_LOG_PATH, "a", encoding="utf-8") as log:
+                    log.write("\n" + error_text[-4000:])
+            except OSError:
+                pass
+        return process.returncode, error_text
 
     @staticmethod
     def _is_timestamp_error(error_text):
@@ -2534,7 +2705,7 @@ class RTSPStreamerGUI:
     def _mark_file_restarting(self):
         if not self.is_streaming or self.closing:
             return
-        self.btn_action.config(text="영상 재연결 중...", bg="#d97706", state="disabled")
+        self.btn_action.config(text="송출 중지", bg="#dc2626", state="normal")
         self.lbl_status.config(
             text="상태: 영상 송출이 중단되어 자동 재연결 중...", fg="#d97706"
         )
@@ -2581,6 +2752,7 @@ class RTSPStreamerGUI:
         if self.closing:
             return
         self.is_streaming = False
+        self.stream_progress = None
         self.btn_action.config(text="송출 시작", bg="#16a34a", state="normal")
         self.btn_browse.config(state="normal")
         self.combo_webcam.config(state="readonly")
